@@ -1,83 +1,149 @@
-# My AI Code Kit
+<div align="center">
 
-## Install
+<img src=".img/banner-pill.png" alt="Rivet" width="60%">
+
+<p>A development workflow for AI coding agents.</p>
+
+<p>
+  <a href="https://opencode.ai/"><img src="https://img.shields.io/badge/OpenCode-V2-black?style=flat-square" alt="OpenCode V2"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.9%2B-blue?style=flat-square" alt="Python 3.9+"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=flat-square" alt="Apache 2.0"></a>
+</p>
+
+</div>
+
+Rivet gives your agent a repeatable path from understanding the codebase to
+shipping a verified change. It is opinionated on purpose. The workflow is the
+product.
+
+## Quick start
+
+Rivet needs macOS, Linux, or WSL, plus Git, Python 3.9+, and OpenCode V2.
 
 ```bash
-git clone https://github.com/DuckKota/my-ai-code-kit.git
-cd my-ai-code-kit
-./bin/setup install   # requires python 3.9+
+# Install Rivet
+curl -fsSL https://raw.githubusercontent.com/DuckKota/rivet/main/installer/run | bash
 
-# Inside a git repository, `setup install` also installs and initializes
-# OpenSpec and codebase-memory-mcp for that project (prompts first; idempotent).
+# Initialize a project
+cd my-project
+rivet init
 ```
 
-> [!important]
-> Manually install the following:
->
-> - [Ponytail](https://github.com/DietrichGebert/ponytail/blob/main/INSTALL.md)
-> - [Planotator](https://plannotator.ai/)
-> - [Magic Context](https://github.com/cortexkit/magic-context#quick-start)
-> - [Open Code Review](https://github.com/alibaba/open-code-review/blob/main/plugins/open-code-review/opencode/README.md) - Prerequisites & Install globally
+`rivet init` is safe to run again. It inspects the project, installs or
+reconciles what is missing, and leaves your own configuration alone.
 
-## Usage
+Check the result:
 
-> [!tip]
-> I work command-first. See my [CHEATSHEET.md](./CHEATSHEET.md) for the workflow.
+```bash
+rivet status
+```
 
-<details>
-<summary>The Complete Kit...</summary>
+If anything needs attention, `rivet status` lists the exact changes and the
+command to fix them.
 
-> **Commands**
-> 
-> - [`/commit-message`](./src/commands/commit-message.md)
-> - [`/grill-me`](./src/commands/grill-me.md)
-> - [`/fix`](./src/commands/fix.md)
-> - [`/handoff`](./src/commands/handoff.md)
-> - [`/humanizer`](./src/commands/humanizer.md)
-> - [`/opsx-refine`](./src/commands/opsx-refine.md)
-> - [`/ponytail`](https://ponytail.dev/)
-> - [`/ponytail-review`](https://ponytail.dev/)
+## The workflow
 
-> **Skills**
-> 
-> - [`diagnosing-bugs`](./src/skills/diagnosing-bugs/)
-> - [`codebase-design`](./src/skills/codebase-design/)
-> - [`domain-modeling`](./src/skills/domain-modeling/)
-> - [`frontend-design`](./src/skills/frontend-design/)
-> - [`humanize-writing`](./src/skills/humanize-writing/)
-> - [`improve-codebase-architecture`](./src/skills/improve-codebase-architecture/)
-> - [`using-git-worktrees`](./src/skills/using-git-worktrees/)
-> - [`verification-before-completion`](./src/skills/verification-before-completion/)
+| Stage | Command | What it does |
+| --- | --- | --- |
+| Sharpen | `/grill-me` | Stress-test the idea before committing to it. |
+| Spec | `/opsx-propose` | Turn the idea into an OpenSpec change with design, specs, and tasks. |
+| Refine | `/opsx-refine` | Second planning pass: catch gaps, cut over-engineering. |
+| Plan review | `/plannotator-annotate` | Annotate the plan before implementation. |
+| Implement | `/opsx-apply` | Work through the change's tasks. |
+| Review | `/ponytail-review` | Cut over-engineering from the diff. |
+| Close | `/opsx-archive` | Archive the completed change. |
+| Commit | `/commit-message` | Generate a Conventional Commit message; `verify-commit` validates it. |
 
-> **Tools**
-> 
-> - [`codebase-memory-mcp`](https://deusdata.github.io/codebase-memory-mcp/)
-> - [`OpenSpec`](https://openspec.dev/)
+Bug fixes skip the ceremony. The fix is already scoped, so it is the spec. Run
+`/fix`, then `/ponytail-review`, then `/commit-message`. If the bug is
+architectural — it spans subsystems, needs design decisions, or is a refactor
+in disguise — enter the feature flow at `/opsx-propose`.
 
-> **Others**
-> 
-> - [`caveman`](./src/instructions/caveman.md)
-> - [`batch-file-writes`](./src/instructions/file-edit-limits.md)
+## Commands
 
-> **OpenCode Themes**
-> 
-> - [Poimandres](https://github.com/ajaxdude/opencode-ai-poimandres-theme): `poimandres`, `poimandres-turquoise-expanded`, `poimandres-accessible`
-> - [Eldritch](https://github.com/eldritch-theme/opencode): `eldritch-cthulhu`, `eldritch-abyss`
-> - [Catppuccin](https://github.com/catppuccin/opencode): 56 themes — 4 flavors (Latte, Frappé, Macchiato, Mocha) × 14 accents (blue, flamingo, green, lavender, maroon, mauve, peach, pink, red, rosewater, sapphire, sky, teal, yellow), e.g. `catppuccin-mocha-teal`
+| Command | What it does |
+| --- | --- |
+| `rivet init` | Initialize or reconcile Rivet in the current project. |
+| `rivet status` | Show the current installation state and what needs attention. |
+| `rivet update` | Update Rivet itself, then reconcile the project. |
+| `rivet uninstall` | Remove Rivet-managed configuration, keeping user files. |
 
-</details>
+Useful flags:
 
----
+```bash
+rivet init --dry-run      # show the plan, change nothing
+rivet init --force        # back up and replace conflicts, prune stale links
+rivet init --no-project   # global configuration only
+rivet init --verbose      # show every file and subprocess
 
-<div align="center">
-    OpenCode support requires V2.
-</div>
+rivet update --dry-run    # check for updates without applying them
+rivet update --force      # apply updates, backing up conflicts
 
-<div align="center">
-  <img src=".img/oc.png" alt="OpenCode" width="96" height="96"/>&nbsp;&nbsp;&nbsp;
-  <img src=".img/omp.png" alt="Oh My Pi" width="96" height="96"/>
-</div>
+rivet uninstall --dry-run # show what would be removed
+```
 
-<div align="center">
-    Apache 2.0
-</div>
+`rivet init`, `rivet status`, `rivet update`, and `rivet uninstall` are
+project-aware. Run them from anywhere inside a Git repository; Rivet resolves
+the root for you.
+
+## Bundled integrations
+
+Rivet installs four integrations. Magic Context is the only manual one: run the
+setup command the installer prints, and `rivet status` reports whether it is
+installed.
+
+| Integration | What it adds |
+| --- | --- |
+| [Ponytail](https://ponytail.dev/) | Lazy-senior review and implementation discipline |
+| [Plannotator](https://plannotator.ai/) | Plan and code annotation UI |
+| [HeadsUp](https://github.com/charlesnutter/opencode-headsup) | Inference telemetry in the sidebar |
+| [Subagent Statusline V2](https://github.com/roboalchemist/opencode-subagent-statusline-v2) | Subagent tree and status footer |
+| [Magic Context](https://github.com/cortexkit/magic-context) | Long-session context management (manual setup) |
+
+## Under the hood
+
+`rivet` is a small CLI backed by a Git checkout. By default it lives at
+`~/.rivet` and registers a `rivet` shell function.
+
+Rivet also installs the skills the workflow invokes, so the agent loads the
+right discipline without you naming it.
+
+`rivet init` does three things:
+
+1. **Installs core configuration.** Commands, skills, instructions, themes, and
+   plugins are linked into the OpenCode config directory. Files that need
+   substitution are written as managed copies.
+2. **Initializes the project.** OpenSpec is set up in the repository, and
+   Codebase Memory gets its instructions, reminder plugin, MCP server entry,
+   and initial graph index.
+3. **Verifies the result.** Anything that still needs attention is reported
+   with a next step.
+
+The manifest (`manifest.toml`) is the source of truth for every core artifact.
+`rivet init --dry-run` compares the manifest with what is on disk, so you can
+see the change before it happens. `rivet uninstall` removes only files that
+still match what Rivet wrote; modified files are preserved and reported.
+Managed copies are recorded by hash in `.rivet-state.json`, and `--force`
+copies conflicts into `.rivet-backups/` before replacing them.
+
+`rivet update` pulls the Rivet checkout, then re-runs `rivet init` in a fresh
+process so new code takes effect immediately.
+
+## Development
+
+```bash
+pip install -r requirements.txt
+
+pytest tests/ -q
+mypy src/
+pylint src/
+
+./installer/test-installer   # end-to-end installer test in an isolated HOME
+```
+
+See [MAINTAINING.md](./MAINTAINING.md) for provenance, vendoring, and the
+per-artifact notes. OpenSpec changes live under `openspec/`.
+
+## License
+
+Apache 2.0. See [LICENSE](./LICENSE).

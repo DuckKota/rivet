@@ -1,6 +1,4 @@
-"""
-Resolve per-agent global configuration directories and detect installed agents.
-"""
+"""Resolve the OpenCode global configuration directory."""
 from __future__ import annotations
 
 import os
@@ -9,27 +7,11 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-# The coding agents this tool can install into.
-AGENTS = ("opencode", "omp")
-
-# Display names for the agent-selection prompt.
-AGENT_LABELS = {
-    "opencode": "OpenCode",
-    "omp": "Oh My Pi",
-}
+# Only OpenCode is supported. The manifest keeps an `agents` field so the
+# schema can grow later; this is the only valid value today.
+AGENTS = ("opencode",)
 
 OPENCODE_FALLBACK = Path.home() / ".config" / "opencode"
-OMP_FALLBACK = Path.home() / ".omp" / "agent"
-
-
-def detect_agents() -> list[str]:
-    """
-    Return the agents whose executables are on PATH, in AGENTS order.
-
-    Returns:
-        The list of detected agent ids (subset of AGENTS).
-    """
-    return [agent for agent in AGENTS if shutil.which(agent)]
 
 
 def _probe(
@@ -92,7 +74,7 @@ def _parse_opencode_path(stdout: str) -> str:
 
 def opencode_config_dir(manifest: dict) -> Path:
     """
-    Resolve the opencode config directory.
+    Resolve the OpenCode config directory.
 
     Precedence:
         OC_CONFIG_DIR env var, then manifest config.default_config_dir,
@@ -113,37 +95,3 @@ def opencode_config_dir(manifest: dict) -> Path:
         return Path(default_dir).expanduser()
 
     return _probe("opencode", ["debug", "paths"], _parse_opencode_path, OPENCODE_FALLBACK)
-
-
-def omp_config_dir() -> Path:
-    """
-    Resolve the Oh My Pi config directory.
-
-    Precedence:
-        `omp config path`, then ~/.omp/agent.
-
-    Returns:
-        The resolved config directory path.
-    """
-    return _probe("omp", ["config", "path"], lambda s: s.strip(), OMP_FALLBACK)
-
-
-def config_dir(agent: str, manifest: dict) -> Path:
-    """
-    Resolve the config directory for the given agent.
-
-    Args:
-        agent: The agent id (one of AGENTS).
-        manifest: The parsed manifest dictionary.
-
-    Returns:
-        The resolved config directory path.
-
-    Raises:
-        ValueError: If agent is not a known agent id.
-    """
-    if agent == "opencode":
-        return opencode_config_dir(manifest)
-    if agent == "omp":
-        return omp_config_dir()
-    raise ValueError(f"unknown agent {agent!r}")

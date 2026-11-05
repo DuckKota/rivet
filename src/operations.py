@@ -1,11 +1,15 @@
 """
-Operations for the setup tool: symlink, text-insert, and config-merge.
+Operations for Rivet: symlink, text-insert, and config-merge.
 """
 from __future__ import annotations
 
 import json
 import shutil
 from pathlib import Path
+
+import jsonc
+import output
+import state
 
 
 def _substituted_content(root: Path, entry: dict, config_dir: Path) -> str:
@@ -15,7 +19,7 @@ def _substituted_content(root: Path, entry: dict, config_dir: Path) -> str:
     Args:
         root: The repository root containing the source file.
         entry: The symlink entry declaring `src` and `replace`.
-        config_dir: The agent config directory (resolves `{config_dir}`).
+        config_dir: The OpenCode config directory (resolves `{config_dir}`).
 
     Returns:
         The source file content with each placeholder replaced.
@@ -28,30 +32,15 @@ def _substituted_content(root: Path, entry: dict, config_dir: Path) -> str:
     return content
 
 
-def _is_managed_copy(entry: dict, config_dir: Path, content: str) -> bool:
-    """
-    Return True if content is a tool-written substituted copy.
-
-    The resolved substitute values embed the config dir path — the tool's
-    signature. A user's own file at the same target would not contain it.
-    Used to tear down copies whose source drifted since install and no longer
-    byte-match today's render.
-
-    Args:
-        entry: The symlink entry declaring `src` and `replace`.
-        config_dir: The agent config directory.
-        content: The on-disk file content.
-
-    Returns:
-        True when every resolved substitute value appears in content.
-    """
-    replace = entry.get("replace")
-    if not replace:
-        return False
-    return all(
-        value.replace("{config_dir}", str(config_dir)) in content
-        for value in replace.values()
+def _backup_target(config_dir: Path, target: Path) -> None:
+    """Back up a user path before --force replaces it."""
+    destination = state.backup(
+        target,
+        config_dir / state.BACKUP_DIR,
+        target.relative_to(config_dir),
     )
+    if destination:
+        output.warning(f"backed up {target} to {destination}")
 
 
 def symlink(
@@ -59,16 +48,20 @@ def symlink(
     config_dir: Path,
     artifact: dict,
     force: bool = False,
-) -> None:
+) -> list[str]:
     """
     Symlink managed file or directory artifacts into the config directory.
 
     Args:
         root: The repository root containing the managed files.
-        config_dir: The agent config directory to link into.
+        config_dir: The OpenCode config directory to link into.
         artifact: The manifest artifact describing the symlink.
         force: Overwrite an existing conflicting file or symlink.
+
+    Returns:
+        One status per entry: "installed", "ready", or "skipped".
     """
+    statuses: list[str] = []
     entries = artifact.get("entries") or [
         {"src": artifact["src"], "target": artifact["target"]}
     ]
@@ -81,71 +74,154 @@ def symlink(
 
         # An entry with a `replace` table is written as a substituted copy (a
         # symlink cannot be edited in place). A leftover symlink from an older
-        # install is unlinked first, since write_text would follow it and
+        # install is unlinked first, since a plain write would follow it and
         # clobber the repo source; a conflicting real file honours --force.
         replace = entry.get("replace")
         if replace:
+            desired = _substituted_content(root, entry, config_dir)
             if target_path.is_symlink():
                 if target_path.resolve() == source_path or force:
                     target_path.unlink()
                 else:
-                    print(
-                        f"  skip {target_path}: differs from managed (use --force)"
+                    output.attention(
+                        "Conflict",
+                        f"{target_path} differs from managed (use --force)",
                     )
+                    statuses.append("skipped")
                     continue
             elif target_path.exists():
-                if not force:
-                    # Idempotent: our copy is already in place.
-                    if target_path.read_text(
-                        encoding="utf-8"
-                    ) == _substituted_content(root, entry, config_dir):
+                if target_path.is_file():
+                    current = target_path.read_text(encoding="utf-8")
+                    if current == desired:
+                        # Idempotent: our copy is already in place.
+                        state.record_file(config_dir, entry["target"], desired)
+                        output.debug(f"already current: {target_path}")
+                        statuses.append("ready")
                         continue
-                    print(f"  skip {target_path}: exists (use --force)")
+                    if state.is_recorded(config_dir, entry["target"], current):
+                        # Our copy drifted with the source, not with a user
+                        # edit; refresh it without --force.
+                        jsonc.write_atomic(str(target_path), desired)
+                        state.record_file(config_dir, entry["target"], desired)
+                        output.debug(f"refreshed {target_path}")
+                        statuses.append("installed")
+                        continue
+                if not force:
+                    output.attention(
+                        "Conflict", f"{target_path} exists (use --force)"
+                    )
+                    statuses.append("skipped")
                     continue
-            target_path.write_text(
-                _substituted_content(root, entry, config_dir), encoding="utf-8"
-            )
-            print(f"  installed {target_path}")
+                _backup_target(config_dir, target_path)
+                if target_path.is_dir():
+                    shutil.rmtree(target_path)
+            jsonc.write_atomic(str(target_path), desired)
+            state.record_file(config_dir, entry["target"], desired)
+            output.debug(f"installed {target_path}")
+            statuses.append("installed")
             continue
 
         if target_path.is_symlink():
             # Already a symlink: skip if it points where we want (idempotent);
             # otherwise only replace it when the user passed --force.
             if target_path.resolve() == source_path:
+                output.debug(f"already linked: {target_path}")
+                statuses.append("ready")
                 continue
             if force:
                 target_path.unlink()
             else:
-                print(f"  skip {target_path}: differs from managed (use --force)")
+                output.attention(
+                    "Conflict", f"{target_path} differs from managed (use --force)"
+                )
+                statuses.append("skipped")
                 continue
         elif target_path.exists():
             # A real file (not a symlink) is in the way — only displace it
-            # with --force, and remove directories recursively.
+            # with --force, after copying it aside, and remove directories
+            # recursively.
             if force:
+                _backup_target(config_dir, target_path)
                 if target_path.is_dir():
                     shutil.rmtree(target_path)
                 else:
                     target_path.unlink()
             else:
-                print(f"  skip {target_path}: exists (use --force)")
+                output.attention("Conflict", f"{target_path} exists (use --force)")
+                statuses.append("skipped")
                 continue
 
         target_path.symlink_to(source_path)
-        print(f"  linked {target_path}")
+        output.debug(f"linked {target_path}")
+        statuses.append("installed")
+
+    return statuses
+
+
+def _text_end_marker(artifact: dict, content: str) -> str:
+    """Return the artifact's end marker, falling back to its last comment."""
+    marker = artifact.get("end_anchor")
+    if marker:
+        return marker
+    return next(
+        (
+            line.strip()
+            for line in reversed(content.splitlines())
+            if line.strip().startswith("<!--")
+        ),
+        artifact["anchor"],
+    )
+
+
+def text_block_state(root: Path, config_dir: Path, artifact: dict) -> str:
+    """
+    Return "missing", "incomplete", "ready", or "outdated" for a text block.
+
+    Args:
+        root: The repository root containing the source text.
+        config_dir: The OpenCode config directory containing the target.
+        artifact: The manifest artifact describing the insertion.
+
+    Returns:
+        The state of the installed block.
+    """
+    content = (root / artifact["src"]).read_text(encoding="utf-8").strip()
+    target_path = config_dir / artifact["target"]
+    if not target_path.exists():
+        return "missing"
+    existing = target_path.read_text(encoding="utf-8")
+    start_marker = artifact["anchor"]
+    end_marker = _text_end_marker(artifact, content)
+    start = existing.find(start_marker)
+    end = (
+        existing.find(end_marker, start + len(start_marker))
+        if start != -1
+        else existing.find(end_marker)
+    )
+    if start == -1 and end == -1:
+        return "missing"
+    if start == -1 or end == -1:
+        return "incomplete"
+    block = existing[start : end + len(end_marker)]
+    return "ready" if block.strip() == content else "outdated"
 
 
 def text_insert(
     root: Path,
     config_dir: Path,
     artifact: dict,
-) -> None:
+) -> str:
     """
-    Insert a text block into a target file, prepending or appending.
+    Insert or refresh a text block in a target file.
 
     Args:
         root: The repository root containing the source text.
-        config_dir: The agent config directory containing the target.
+        config_dir: The OpenCode config directory containing the target.
         artifact: The manifest artifact describing the insertion.
+
+    Returns:
+        "installed" when the block was written, "ready" when already current,
+        or "skipped" when the markers are incomplete.
     """
     content = (root / artifact["src"]).read_text(encoding="utf-8").strip()
     target_path = config_dir / artifact["target"]
@@ -153,25 +229,54 @@ def text_insert(
     existing = (
         target_path.read_text(encoding="utf-8") if target_path.exists() else ""
     )
+    start_marker = artifact["anchor"]
+    end_marker = _text_end_marker(artifact, content)
+    start = existing.find(start_marker)
+    end = (
+        existing.find(end_marker, start + len(start_marker))
+        if start != -1
+        else existing.find(end_marker)
+    )
 
-    # Anchor text already present — the block was inserted before; don't
-    # duplicate it (keeps install idempotent).
-    if artifact["anchor"] in existing:
-        return
+    if start != -1 and end != -1:
+        end += len(end_marker)
+        if existing[start:end].strip() == content:
+            output.debug(f"already present: {target_path}")
+            return "ready"
+        destination = state.backup(
+            target_path,
+            config_dir / state.BACKUP_DIR,
+            target_path.relative_to(config_dir),
+        )
+        if destination:
+            output.warning(f"backed up {target_path} to {destination}")
+        new_content = existing[:start] + content + existing[end:]
+        jsonc.write_atomic(str(target_path), new_content)
+        output.debug(f"refreshed text block in {target_path}")
+        return "installed"
+
+    if start != -1 or end != -1:
+        output.attention(
+            "Conflict",
+            f"{target_path} has an incomplete Rivet block; fix the markers",
+        )
+        return "skipped"
+
     if artifact.get("mode", "append") == "prepend":
         new_content = content + "\n\n" + existing
     else:
         new_content = existing.rstrip() + "\n\n" + content + "\n"
 
-    target_path.write_text(new_content, encoding="utf-8")
-    print(f"  inserted text block into {target_path}")
+    jsonc.write_atomic(str(target_path), new_content)
+    output.debug(f"inserted text block into {target_path}")
+    return "installed"
 
 
 def _text_remove(
     root: Path,
     config_dir: Path,
     artifact: dict,
-) -> None:
+) -> bool:
     """
     Remove a previously inserted text block from its target file.
 
@@ -184,138 +289,59 @@ def _text_remove(
 
     Args:
         root: The repository root containing the source text.
-        config_dir: The agent config directory containing the target.
+        config_dir: The OpenCode config directory containing the target.
         artifact: The manifest artifact describing the insertion.
+
+    Returns:
+        True when the target file changed.
     """
     content = (root / artifact["src"]).read_text(encoding="utf-8").strip()
     target_path = config_dir / artifact["target"]
     if not target_path.exists():
-        return
+        return False
     existing = target_path.read_text(encoding="utf-8")
     start_marker = artifact["anchor"]
     start = existing.find(start_marker)
     if start == -1:
-        return  # never inserted
-    # Closing marker: the source block's trailing comment line.
-    end_marker = next(
-        (
-            line.strip()
-            for line in reversed(content.splitlines())
-            if line.strip().startswith("<!--")
-        ),
-        start_marker,
-    )
+        return False  # never inserted
+    end_marker = _text_end_marker(artifact, content)
     end = existing.find(end_marker, start + len(start_marker))
     if end == -1:
-        return  # no closing marker; leave it rather than mangle the file
+        return False  # no closing marker; leave it rather than mangle the file
     end += len(end_marker)
     new_content = (existing[:start] + existing[end:]).strip("\n") + "\n"
     if new_content == existing:
-        return
-    target_path.write_text(new_content, encoding="utf-8")
+        return False
+    destination = state.backup(
+        target_path,
+        config_dir / state.BACKUP_DIR,
+        target_path.relative_to(config_dir),
+    )
+    if destination:
+        output.warning(f"backed up {target_path} to {destination}")
+    jsonc.write_atomic(str(target_path), new_content)
+    return True
 
 
-def _yaml_scalar(value) -> str:
-    """Render a scalar as a YAML value, quoting only when necessary."""
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    # Strings that are plain YAML scalars can stay bare; anything ambiguous
-    # (colons, quotes, leading/trailing space, or a boolean-looking word) is
-    # double-quoted via JSON, which is valid YAML.
-    s = str(value)
-    if (
-        s
-        and s == s.strip()
-        and not any(c in s for c in ":{}#&*!|>%@`\"'")
-        and s.lower() not in ("true", "false", "null", "yes", "no", "on", "off")
-    ):
-        return s
-    return json.dumps(s)
-
-
-def _indent(line: str) -> int:
-    """Count leading spaces of a line (YAML block indentation)."""
-    return len(line) - len(line.lstrip(" "))
-
-
-def _yaml_block_end(lines: list[str], start: int, parent_indent: int) -> int:
-    """Index after a mapping's children: first line at or above parent indent."""
-    i = start
-    while i < len(lines):
-        line = lines[i]
-        if line.strip() and not line.lstrip().startswith("#") and _indent(line) <= parent_indent:
-            break
-        i += 1
-    return i
-
-
-def _yaml_find_key(lines: list[str], start: int, end: int, indent: int, key: str) -> int:
-    """Index of the `key:` line at the given indent within [start, end), or -1."""
-    for i in range(start, end):
-        line = lines[i]
-        if line.strip() and not line.lstrip().startswith("#") and _indent(line) == indent:
-            if line.lstrip().startswith(key + ":"):
-                return i
-    return -1
-
-
-def _set_yaml_path(text: str, path: str, value) -> str:
-    """Return `text` with the dotted mapping `path` set to `value`.
-
-    Dependency-free line edit: only the target key's line(s) change, so
-    unrelated lines, comments, and formatting are preserved. Supports mapping
-    keys only (no list indices), which covers every declared config path.
-    """
-    segments = path.split(".")
-    lines = text.split("\n") if text.strip() else []
-    start, end, indent = 0, len(lines), 0
-
-    for idx, seg in enumerate(segments):
-        last = idx == len(segments) - 1
-        key_line = _yaml_find_key(lines, start, end, indent, seg)
-        if key_line == -1:
-            # Insert the remaining path (and value on the leaf) at block end.
-            new_lines = []
-            for j, s in enumerate(segments[idx:]):
-                pad = " " * (indent + j * 2)
-                suffix = f" {_yaml_scalar(value)}" if j == len(segments) - idx - 1 else ""
-                new_lines.append(f"{pad}{s}:{suffix}")
-            lines[end:end] = new_lines
-            return "\n".join(lines).rstrip("\n") + "\n"
-        if last:
-            stripped = lines[key_line].lstrip()
-            pad = lines[key_line][: len(lines[key_line]) - len(stripped)]
-            lines[key_line] = f"{pad}{seg}: {_yaml_scalar(value)}"
-            return "\n".join(lines).rstrip("\n") + "\n"
-        start = key_line + 1
-        end = _yaml_block_end(lines, start, indent)
-        indent += 2
-    return "\n".join(lines).rstrip("\n") + "\n"
-
-
-def config_merge(
-    _root: Path,
-    config_dir: Path,
+def config_merge_text(
     artifact: dict,
+    current_text: str,
     mcp_bin: str = "",
-) -> None:
+) -> str:
     """
-    Merge a JSON/YAML config entry into a target config file.
+    Return the config text with the artifact's entry merged in.
 
     Args:
-        config_dir: The agent config directory containing the target.
         artifact: The manifest artifact describing the merge.
+        current_text: The existing file content ("" when absent).
         mcp_bin: The codebase-memory-mcp binary path to substitute.
-    """
-    target_path = config_dir / artifact["config_file"]
-    target_path.parent.mkdir(parents=True, exist_ok=True)
 
+    Returns:
+        The merged text. Equal to current_text when the entry is current.
+
+    Raises:
+        ValueError: If the existing config is unparseable or not an object.
+    """
     # Substitute the resolved mcp binary path before parsing the value.
     raw_value = artifact["value"].replace("<MCP_BIN>", mcp_bin)
     try:
@@ -324,30 +350,16 @@ def config_merge(
         # Value isn't JSON — store it as a raw string instead.
         value = raw_value
 
-    if target_path.suffix in (".yml", ".yaml"):
-        text = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
-        merged = _set_yaml_path(text, artifact["config_path"], value)
-        if merged == text:
-            return  # idempotent: already merged
-        target_path.write_text(merged, encoding="utf-8")
-        print(f"  merged {target_path}")
-        return
-
     data: dict = {}
-    if target_path.exists():
-        raw = target_path.read_text(encoding="utf-8")
-        if raw.strip():
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as error:
-                raise ValueError(
-                    f"refusing to merge into unparseable {target_path}; "
-                    "fix or remove it first"
-                ) from error
-            if not isinstance(data, dict):
-                raise ValueError(
-                    f"refusing to merge into non-object {target_path}"
-                )
+    if current_text.strip():
+        try:
+            data = json.loads(current_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"refusing to merge into unparseable config: {error}"
+            ) from error
+        if not isinstance(data, dict):
+            raise ValueError("refusing to merge into non-object config")
 
     # Walk the dotted config_path (e.g. "mcp.servers.foo"), creating any
     # intermediate dicts, then set the final leaf key to the value.
@@ -355,17 +367,99 @@ def config_merge(
     for key in artifact["config_path"].split(".")[:-1]:
         existing = node.setdefault(key, {})
         if not isinstance(existing, dict):
-            raise ValueError(f"{target_path}: config key {key!r} is not a table")
+            raise ValueError(f"config key {key!r} is not a table")
         node = existing
     leaf = artifact["config_path"].split(".")[-1]
-    # Idempotent only when the key is actually present with the target value.
-    # `node.get(leaf) == value` would also return True for an absent key when
-    # value is JSON null, skipping the write.
-    if leaf in node and node[leaf] == value:
-        return  # idempotent: already merged
+    if leaf in node:
+        # A default must not replace a value the user already chose.
+        if artifact.get("only_if_absent"):
+            return current_text
+        # Idempotent only when the key is actually present with the target
+        # value. `node.get(leaf) == value` would also return True for an
+        # absent key when value is JSON null, skipping the write.
+        if node[leaf] == value:
+            return current_text
     node[leaf] = value
-    target_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    print(f"  merged {target_path}")
+    return json.dumps(data, indent=2) + "\n"
+
+
+def config_merge(
+    _root: Path,
+    config_dir: Path,
+    artifact: dict,
+    mcp_bin: str = "",
+) -> str:
+    """
+    Merge a JSON config entry into a target config file.
+
+    Args:
+        config_dir: The OpenCode config directory containing the target.
+        artifact: The manifest artifact describing the merge.
+        mcp_bin: The codebase-memory-mcp binary path to substitute.
+
+    Returns:
+        "installed" when the file was written, "ready" when already merged.
+    """
+    target_path = config_dir / artifact["config_file"]
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    current = target_path.read_text(encoding="utf-8") if target_path.exists() else ""
+
+    try:
+        merged = config_merge_text(artifact, current, mcp_bin)
+    except ValueError as error:
+        raise ValueError(f"{error} ({target_path}); fix or remove it first") from error
+
+    if merged == current:
+        output.debug(f"already merged: {target_path}")
+        return "ready"
+    jsonc.write_atomic(str(target_path), merged)
+    output.debug(f"merged {target_path}")
+    return "installed"
+
+
+_GROUP_LABELS = {
+    "command": "Commands",
+    "skill": "Skills",
+    "theme": "Themes",
+    "plugin": "Plugins",
+    "instruction": "Instructions",
+}
+_GROUP_ORDER = (
+    "Commands",
+    "Skills",
+    "Themes",
+    "Plugins",
+    "Instructions",
+    "Configuration",
+)
+_CONFIG_GROUP = "Configuration"
+
+
+def _artifact_group(artifact: dict) -> str:
+    """Return the user-facing summary group for an artifact."""
+    if artifact["operation"] == "config-merge":
+        return _CONFIG_GROUP
+    kind = artifact.get("type", "other")
+    return _GROUP_LABELS.get(kind, kind.replace("-", " ").title())
+
+
+def _print_summary(order: list[str], groups: dict[str, dict[str, int]]) -> None:
+    """Print one compact line per component group."""
+    for label in order:
+        counts = groups[label]
+        total = counts["installed"] + counts["ready"] + counts["skipped"]
+        if total == 0:
+            continue
+        if counts["skipped"]:
+            ready = counts["installed"] + counts["ready"]
+            skipped = counts["skipped"]
+            output.attention(label, f"{ready} ready, {skipped} skipped")
+        elif label == _CONFIG_GROUP and counts["installed"] == total:
+            output.success(label, "updated")
+        elif counts["installed"] == total:
+            output.success(label, f"{total} installed")
+        else:
+            output.success(label, f"{total} ready")
 
 
 def install(
@@ -373,41 +467,57 @@ def install(
     root: Path,
     config_dir: Path,
     force: bool = False,
-    agent: str = "",
-) -> None:
+) -> dict[str, dict[str, int]]:
     """
     Bring the managed config farm up, idempotently.
 
     Args:
         manifest: The parsed manifest dictionary.
         root: The repository root.
-        config_dir: The agent config directory.
+        config_dir: The OpenCode config directory.
         force: Overwrite conflicting files.
-        agent: Only install artifacts that declare this agent; empty installs all.
+
+    Returns:
+        Per-group counts of installed, ready, and skipped artifacts.
     """
     mcp_bin = shutil.which("codebase-memory-mcp") or "codebase-memory-mcp"
     config_dir.mkdir(parents=True, exist_ok=True)
+    order: list[str] = []
+    groups: dict[str, dict[str, int]] = {}
+
     for artifact in manifest["artifacts"]:
-        if agent and agent not in artifact.get("agents", []):
-            continue
         operation = artifact["operation"]
         if operation == "symlink":
-            symlink(root, config_dir, artifact, force)
+            statuses = symlink(root, config_dir, artifact, force)
         elif operation == "text-insert":
-            text_insert(root, config_dir, artifact)
+            statuses = [text_insert(root, config_dir, artifact)]
         elif operation == "config-merge":
-            config_merge(root, config_dir, artifact, mcp_bin)
+            statuses = [config_merge(root, config_dir, artifact, mcp_bin)]
         else:  # pragma: no cover
             raise ValueError(f"unknown operation {operation}")
 
+        label = _artifact_group(artifact)
+        if label not in groups:
+            groups[label] = {"installed": 0, "ready": 0, "skipped": 0}
+            order.append(label)
+        for status in statuses:
+            groups[label][status] += 1
 
-def expected_symlink_targets(manifest: dict, agent: str = "") -> set[str]:
+    order.sort(
+        key=lambda label: _GROUP_ORDER.index(label)
+        if label in _GROUP_ORDER
+        else len(_GROUP_ORDER)
+    )
+    _print_summary(order, groups)
+    return groups
+
+
+def expected_symlink_targets(manifest: dict) -> set[str]:
     """
     Return the set of managed symlink targets declared in the manifest.
 
     Args:
         manifest: The parsed manifest dictionary.
-        agent: Only count artifacts declaring this agent; empty counts all.
 
     Returns:
         The set of relative symlink target paths.
@@ -415,8 +525,6 @@ def expected_symlink_targets(manifest: dict, agent: str = "") -> set[str]:
     targets: set[str] = set()
 
     for artifact in manifest["artifacts"]:
-        if agent and agent not in artifact.get("agents", []):
-            continue
         if artifact["operation"] != "symlink":
             continue
         entries = artifact.get("entries") or [{"target": artifact["target"]}]
@@ -431,26 +539,30 @@ def managed_symlinks(
     root: Path,
 ):
     """
-    Yield managed symlinks under config_dir that point into root/src.
+    Yield managed symlinks under config_dir that point into root/content.
 
     Args:
-        config_dir: The agent config directory to scan.
+        config_dir: The OpenCode config directory to scan.
         root: The repository root.
 
     Yields:
         Tuples of (symlink_path, relative_target).
     """
-    src_prefix = str((root / "src").resolve())
+    content_root = (root / "content").resolve()
     for path in config_dir.rglob("*"):
         if path.is_symlink():
+            relative = path.relative_to(config_dir)
+            # Backup copies are user data, not installed links.
+            if relative.parts and relative.parts[0] == state.BACKUP_DIR:
+                continue
             try:
                 resolved = path.resolve()
             except OSError:
                 continue
-            # Only treat symlinks that point into this repo's src/ as managed;
-            # user-created links elsewhere are left alone.
-            if str(resolved).startswith(src_prefix):
-                yield path, str(path.relative_to(config_dir))
+            # Only treat symlinks that point into this repo's content/ as
+            # managed; user-created links elsewhere are left alone.
+            if resolved.is_relative_to(content_root):
+                yield path, str(relative)
 
 
 def sync(
@@ -459,43 +571,48 @@ def sync(
     config_dir: Path,
     force: bool = False,
     prune: bool = True,
-    *,
-    agent: str = "",
-) -> None:
+) -> dict[str, dict[str, int]]:
     """
     Install and remove stale managed symlinks.
 
     Args:
         manifest: The parsed manifest dictionary.
         root: The repository root.
-        config_dir: The agent config directory.
+        config_dir: The OpenCode config directory.
         force: Overwrite conflicting files.
         prune: Remove stale managed symlinks (default True).
-        agent: Only operate on artifacts declaring this agent; empty = all.
+
+    Returns:
+        Per-group counts of installed, ready, and skipped artifacts.
     """
-    install(manifest, root, config_dir, force, agent)
+    groups = install(manifest, root, config_dir, force)
 
     if not prune:
-        return
+        return groups
 
     # Prune: remove managed symlinks no longer declared in the manifest
     # (e.g. after an artifact was renamed or dropped). Replace-substituted
     # copies are NOT pruned here: once an artifact is dropped, its copy is
     # indistinguishable from a user file, so deleting it would be unsafe.
     # (uninstall() handles in-manifest teardown by content comparison.)
-    expected = expected_symlink_targets(manifest, agent)
+    expected = expected_symlink_targets(manifest)
+    removed = 0
     for path, relative_target in list(managed_symlinks(config_dir, root)):
         if relative_target not in expected:
-            print(f"  removing stale managed symlink: {path}")
+            output.debug(f"removing stale managed symlink: {path}")
             path.unlink()
+            removed += 1
+    if removed:
+        noun = "link" if removed == 1 else "links"
+        output.success("Cleanup", f"{removed} stale {noun} removed")
+    return groups
 
 
 def uninstall(
     manifest: dict,
     root: Path,
     config_dir: Path,
-    agent: str = "",
-) -> None:
+) -> int:
     """
     Tear down managed symlinks, substituted copies, and inserted text blocks,
     keeping user files.
@@ -503,12 +620,16 @@ def uninstall(
     Args:
         manifest: The parsed manifest dictionary.
         root: The repository root.
-        config_dir: The agent config directory.
-        agent: Only operate on artifacts declaring this agent; empty = all.
+        config_dir: The OpenCode config directory.
+
+    Returns:
+        The number of managed items removed.
     """
+    removed = 0
     for path, _ in list(managed_symlinks(config_dir, root)):
-        print(f"  removing managed symlink: {path}")
+        output.debug(f"removing managed symlink: {path}")
         path.unlink()
+        removed += 1
     # Replace-substituted entries are written as copies, so the symlink scan
     # above misses them; remove them here for a complete teardown. Plain
     # symlink entries that were installed as copies by an earlier tool (rather
@@ -516,36 +637,43 @@ def uninstall(
     # Only a file that still matches exactly the content the tool would write
     # is removed — a user's own file at the same path is kept.
     for artifact in manifest["artifacts"]:
-        if agent and agent not in artifact.get("agents", []):
-            continue
         if artifact["operation"] != "symlink":
             continue
         entries = artifact.get("entries") or [
             {"src": artifact["src"], "target": artifact["target"]}
         ]
         for entry in entries:
-            target = config_dir / entry["target"]
+            relative = entry["target"]
+            target = config_dir / relative
             if target.is_symlink() or target.is_dir() or not target.exists():
                 continue
             content = target.read_text(encoding="utf-8")
             # Remove a file that matches what the tool would write today, or
-            # that is recognizably a tool-written substituted copy (source
-            # may have drifted since install). A user's own file at the same
-            # path has neither property and is kept.
+            # whose hash Rivet recorded at install time. A user's own file at
+            # the same path has neither property and is kept.
             if content == _substituted_content(root, entry, config_dir) or (
-                _is_managed_copy(entry, config_dir, content)
+                state.is_recorded(config_dir, relative, content)
             ):
-                print(f"  removing managed file: {target}")
+                output.debug(f"removing managed file: {target}")
                 target.unlink()
+                state.forget_file(config_dir, relative)
+                removed += 1
     # text-insert artifacts inject a block into a target file (e.g. AGENTS.md);
     # tear them down too, keeping any user-edited block in place.
     for artifact in manifest["artifacts"]:
-        if agent and agent not in artifact.get("agents", []):
-            continue
         if artifact["operation"] == "text-insert":
             target = config_dir / artifact["target"]
-            if target.exists() and artifact["anchor"] in target.read_text(
-                encoding="utf-8"
-            ):
-                print(f"  removing managed text block: {target}")
-                _text_remove(root, config_dir, artifact)
+            if target.exists() and text_block_state(
+                root, config_dir, artifact
+            ) != "missing":
+                if _text_remove(root, config_dir, artifact):
+                    output.debug(f"removing managed text block: {target}")
+                    removed += 1
+    state.clear(config_dir)
+
+    if removed:
+        items = output.plural(removed, "managed item")
+        output.success("Core", f"{items} removed")
+    else:
+        output.skip("Core", "nothing to remove")
+    return removed

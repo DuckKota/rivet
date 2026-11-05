@@ -7,7 +7,16 @@ test:
       - PYTHON_IMAGE: ["python:3.9", "python:3.11"]
   image: $PYTHON_IMAGE
   script:
+    # Python linters
     - pytest tests/ -q
     - mypy src/
     - pylint src/
+    # Bash syntax checks
+    - bash -n installer/run bin/rivet installer/test-installer
+    - |
+      for file in installer/lib/*.sh installer/steps/*.sh
+      do
+        bash -n "$file"
+      done
+    # Manifest syntax check
     - python -c "import sys; sys.path.insert(0,'src'); import manifest; manifest.load('manifest.toml'); print('manifest OK')"

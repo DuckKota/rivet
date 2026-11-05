@@ -1,7 +1,7 @@
 # Vendored: tomli 2.4.1
 
 Frozen MIT-licensed backport of stdlib `tomllib` (Python < 3.11). Vendored so
-`bin/setup` needs no pip install / no global package on 3.9/3.10 and works on
+`bin/rivet` needs no pip install / no global package on 3.9/3.10 and works on
 PEP 668 managed Pythons. Imported by `src/manifest.py` only as a fallback when
 `tomllib` is absent.
 

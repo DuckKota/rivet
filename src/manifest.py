@@ -10,6 +10,7 @@ except ModuleNotFoundError:  # Python < 3.11
 from pathlib import Path
 
 import config
+import jsonc
 
 OPERATIONS = ("symlink", "config-merge", "text-insert")
 PROVENANCES = ("original", "vendor", "fork")
@@ -154,6 +155,10 @@ def validate(data: dict) -> None:
                 and artifact.get("anchor")
             ):
                 raise ManifestError(f"{name}: text-insert needs src/target/anchor")
+            if "end_anchor" in artifact and not isinstance(
+                artifact["end_anchor"], str
+            ):
+                raise ManifestError(f"{name}: text-insert end_anchor must be a string")
         elif operation == "config-merge":
             if not (
                 isinstance(artifact.get("config_file"), str)
@@ -166,6 +171,12 @@ def validate(data: dict) -> None:
                 )
             if "value" not in artifact or not isinstance(artifact["value"], str):
                 raise ManifestError(f"{name}: config-merge needs string `value`")
+            if "only_if_absent" in artifact and not isinstance(
+                artifact["only_if_absent"], bool
+            ):
+                raise ManifestError(
+                    f"{name}: config-merge only_if_absent must be a boolean"
+                )
 
 
 def find(
@@ -246,4 +257,4 @@ def set_sha(
     if not updated:
         raise ManifestError(f"no source_sha found for artifact {name!r}")
 
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    jsonc.write_atomic(str(path), "\n".join(out) + "\n")

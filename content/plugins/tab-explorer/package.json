@@ -1,0 +1,6 @@
+{
+  "name": "tab-explorer",
+  "private": true,
+  "type": "module",
+  "exports": { "./tui": "./tui.tsx" }
+}

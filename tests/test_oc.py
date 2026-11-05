@@ -1,9 +1,8 @@
-"""Tests for the My AI Code Kit python tooling."""
+"""Tests for the Rivet python tooling."""
 from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,14 +13,17 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 import config  # noqa: E402
-import kit  # noqa: E402
+import rivet  # noqa: E402
 import project  # noqa: E402
+import jsonc  # noqa: E402
 import manifest  # noqa: E402
 import merge  # noqa: E402
 import operations  # noqa: E402
+import output  # noqa: E402
 import shell_rc  # noqa: E402
+import state  # noqa: E402
 
-MANIFEST = REPO / "manifest.toml"
+MANIFEST_PATH = REPO / "manifest.toml"
 
 
 def git(*args, cwd=None):
@@ -45,11 +47,11 @@ def git_out(*args, cwd=None) -> str:
 
 # ------------------------------------------------------------------ manifest
 def test_manifest_loads_and_validates():
-    m = manifest.load(MANIFEST)
+    m = manifest.load(MANIFEST_PATH)
     names = manifest.artifact_names(m)
     assert "grill-me" in names
     assert "caveman" in names
-    assert "glab" in names
+    assert "humanize-writing" in names
 
 
 def test_set_sha_edits_correct_artifact(tmp_path):
@@ -70,20 +72,20 @@ def test_set_sha_edits_correct_artifact(tmp_path):
 # ------------------------------------------------------------- config dir
 def test_config_dir_env_override(monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", "/tmp/fake")
-    assert config.config_dir("opencode", {}) == Path("/tmp/fake")
+    assert config.opencode_config_dir({}) == Path("/tmp/fake")
 
 
 def test_config_dir_manifest_default(monkeypatch):
     monkeypatch.delenv("OC_CONFIG_DIR", raising=False)
     m = {"config": {"default_config_dir": "~/x"}}
-    assert config.config_dir("opencode", m) == Path.home() / "x"
+    assert config.opencode_config_dir(m) == Path.home() / "x"
 
 
 # ---------------------------------------------------------------- install
 def test_install_symlinks_text_and_config(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
-    operations.install(manifest.load(MANIFEST), REPO, cfg)
+    cfg = config.opencode_config_dir({})
+    operations.install(manifest.load(MANIFEST_PATH), REPO, cfg)
 
     cmd = cfg / "commands" / "commit-message.md"
     # commit-message.md carries placeholder substitution, so it is installed
@@ -100,15 +102,28 @@ def test_install_symlinks_text_and_config(tmp_path, monkeypatch):
     assert "file-edit-size-limits:start" in text
 
     cli = json.loads((cfg / "cli.json").read_text())
-    assert cli["theme"]["name"] == "catppuccin-mocha-teal"
+    assert cli["theme"]["name"] == "github"
     # codebase-memory-mcp is per-project now (see project), not global config.
     assert not (cfg / "opencode.json").exists()
+    assert (cfg / state.STATE_FILE).exists()
+
+
+def test_install_preserves_existing_theme(tmp_path, monkeypatch):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    cfg.mkdir(parents=True)
+    (cfg / "cli.json").write_text('{"theme": {"name": "catppuccin"}}\n')
+
+    operations.install(manifest.load(MANIFEST_PATH), REPO, cfg)
+
+    cli = json.loads((cfg / "cli.json").read_text())
+    assert cli["theme"]["name"] == "catppuccin"
 
 
 def test_install_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
-    m = manifest.load(MANIFEST)
+    cfg = config.opencode_config_dir({})
+    m = manifest.load(MANIFEST_PATH)
     operations.install(m, REPO, cfg)
     agents_before = (cfg / "AGENTS.md").read_text()
     operations.install(m, REPO, cfg)
@@ -116,10 +131,129 @@ def test_install_idempotent(tmp_path, monkeypatch):
     assert (cfg / "AGENTS.md").read_text().count("caveman-begin") == 1
 
 
+def test_text_insert_refreshes_changed_block(tmp_path, monkeypatch):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    root = tmp_path / "root"
+    src = root / "content" / "instructions" / "demo.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("<!-- demo-start -->\nnew body\n<!-- demo-end -->\n")
+    artifact = {
+        "name": "demo",
+        "operation": "text-insert",
+        "src": "content/instructions/demo.md",
+        "target": "AGENTS.md",
+        "mode": "prepend",
+        "anchor": "<!-- demo-start -->",
+        "end_anchor": "<!-- demo-end -->",
+    }
+
+    target = cfg / "AGENTS.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "<!-- demo-start -->\nold body\n<!-- demo-end -->\n\nuser notes\n"
+    )
+
+    assert operations.text_insert(root, cfg, artifact) == "installed"
+    text = target.read_text()
+    assert "new body" in text
+    assert "old body" not in text
+    assert text.endswith("user notes\n")
+    assert text.count("demo-start") == 1
+
+
+def test_install_output_summarizes_components(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    output.set_verbose(False)
+    cfg = config.opencode_config_dir({})
+
+    operations.install(manifest.load(MANIFEST_PATH), REPO, cfg)
+
+    out = capsys.readouterr().out
+    assert "✓ Commands" in out
+    assert "6 installed" in out
+    assert "✓ Skills" in out
+    assert "11 installed" in out
+    assert "✓ Themes" in out
+    assert "63 installed" in out
+    assert "✓ Instructions" in out
+    assert "2 installed" in out
+    assert "✓ Configuration" in out
+    assert "updated" in out
+    assert "linked " not in out
+    assert str(cfg) not in out
+
+
+def test_install_output_reports_ready_on_rerun(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    output.set_verbose(False)
+    cfg = config.opencode_config_dir({})
+    m = manifest.load(MANIFEST_PATH)
+    operations.install(m, REPO, cfg)
+    capsys.readouterr()
+
+    operations.install(m, REPO, cfg)
+
+    out = capsys.readouterr().out
+    assert "6 ready" in out
+    assert "11 ready" in out
+    assert "63 ready" in out
+    assert "installed" not in out
+
+
+def test_install_output_reports_conflicts(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    output.set_verbose(False)
+    cfg = config.opencode_config_dir({})
+    (cfg / "commands").mkdir(parents=True)
+    (cfg / "commands" / "fix.md").write_text("mine\n")
+
+    operations.install(manifest.load(MANIFEST_PATH), REPO, cfg)
+
+    out = capsys.readouterr().out
+    assert "! Conflict" in out
+    assert "use --force" in out
+    assert "! Commands" in out
+    assert "5 ready, 1 skipped" in out
+
+
+def test_install_verbose_shows_file_details(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    output.set_verbose(True)
+    try:
+        operations.install(manifest.load(MANIFEST_PATH), REPO, cfg)
+    finally:
+        output.set_verbose(False)
+
+    out = capsys.readouterr().out
+    assert "linked " in out
+    assert str(cfg) in out
+    assert "6 installed" in out
+
+
+def test_output_color_respects_no_color(monkeypatch):
+    class TTY:
+        def isatty(self):
+            return True
+
+    class Pipe:
+        def isatty(self):
+            return False
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("TERM", raising=False)
+    assert output._color_enabled(TTY())  # pylint: disable=protected-access
+    assert not output._color_enabled(Pipe())  # pylint: disable=protected-access
+
+    monkeypatch.setenv("NO_COLOR", "")
+    assert not output._color_enabled(TTY())  # pylint: disable=protected-access
+
+
 def test_uninstall_removes_text_blocks(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
-    m = manifest.load(MANIFEST)
+    cfg = config.opencode_config_dir({})
+    m = manifest.load(MANIFEST_PATH)
     operations.install(m, REPO, cfg)
 
     # marker-delimited blocks are removed even when their interior drifted
@@ -139,80 +273,47 @@ def test_uninstall_removes_text_blocks(tmp_path, monkeypatch):
     assert "file-edit-size-limits:stop" not in final
 
 
-def test_uninstall_notice_reports_project_init(tmp_path, capsys):
-    # A project carrying codebase-memory-mcp per-project init gets a notice
-    # that uninstall leaves it alone.
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    git("init", cwd=repo)
-    (repo / "AGENTS.md").write_text("<!-- codebase-memory-mcp:start -->\nhi\n")
-    (repo / ".opencode" / "plugins").mkdir(parents=True)
-    (repo / ".opencode" / "plugins" / "CodebaseMemoryReminder.ts").write_text("x")
-    project.uninstall_notice(repo)
-    assert "codebase-memory-mcp" in capsys.readouterr().out
+def test_uninstall_does_not_report_removing_incomplete_block(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    artifact = {
+        "name": "caveman",
+        "operation": "text-insert",
+        "src": "content/instructions/caveman.md",
+        "target": "AGENTS.md",
+        "mode": "prepend",
+        "anchor": "<!-- caveman-begin -->",
+        "end_anchor": "<!-- caveman-end -->",
+    }
+    target = cfg / "AGENTS.md"
+    target.parent.mkdir(parents=True)
+    original = "<!-- caveman-begin -->\nbody\n"
+    target.write_text(original)
 
+    output.set_verbose(True)
+    try:
+        removed = operations.uninstall({"artifacts": [artifact]}, REPO, cfg)
+    finally:
+        output.set_verbose(False)
 
-def test_uninstall_notice_reports_v2_mcp_config(tmp_path, capsys):
-    # A V2-native mcp.servers entry alone must trigger the notice too.
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    git("init", cwd=repo)
-    (repo / ".opencode").mkdir()
-    (repo / ".opencode" / "opencode.json").write_text(
-        json.dumps(
-            {
-                "mcp": {
-                    "servers": {
-                        "codebase-memory-mcp": {
-                            "type": "local",
-                            "command": ["/bin/cbm"],
-                        }
-                    }
-                }
-            }
-        )
-    )
-    project.uninstall_notice(repo)
-    assert "codebase-memory-mcp" in capsys.readouterr().out
-
-
-def test_uninstall_notice_reports_omp_project_init(tmp_path, capsys):
-    # An Oh My Pi install leaves .omp/ artifacts; the notice must surface them.
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    git("init", cwd=repo)
-    (repo / ".omp" / "extensions").mkdir(parents=True)
-    (repo / ".omp" / "extensions" / "CodebaseMemoryReminder.ts").write_text("x")
-    project.uninstall_notice(repo)
     out = capsys.readouterr().out
-    assert "codebase-memory-mcp" in out
-    assert ".omp" in out
-
-
-def test_uninstall_notice_silent_without_init(tmp_path, capsys):
-    # A clean project (and a non-git dir) triggers no notice.
-    repo = tmp_path / "proj"
-    repo.mkdir()
-    git("init", cwd=repo)
-    (repo / "AGENTS.md").write_text("plain\n")
-    project.uninstall_notice(repo)
-    assert capsys.readouterr().out == ""
-
-    (tmp_path / "notgit").mkdir()
-    project.uninstall_notice(tmp_path / "notgit")
-    assert capsys.readouterr().out == ""
+    assert removed == 0
+    assert "removing managed text block" not in out
+    assert target.read_text() == original
 
 
 # -------------------------------------------------------------------- sync
 def test_sync_removes_stale_keeps_user_file(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
-    m = manifest.load(MANIFEST)
+    cfg = config.opencode_config_dir({})
+    m = manifest.load(MANIFEST_PATH)
     operations.install(m, REPO, cfg)
 
     stale = cfg / "commands" / "stale-ghost.md"
     stale.parent.mkdir(parents=True, exist_ok=True)
-    stale.symlink_to(REPO / "src" / "commands" / "fix.md")
+    stale.symlink_to(REPO / "content" / "commands" / "fix.md")
 
     user = cfg / "commands" / "my-own.md"
     user.write_text("user file")
@@ -224,13 +325,13 @@ def test_sync_removes_stale_keeps_user_file(tmp_path, monkeypatch):
 
 def test_sync_prune_false_keeps_stale(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
-    m = manifest.load(MANIFEST)
+    cfg = config.opencode_config_dir({})
+    m = manifest.load(MANIFEST_PATH)
     operations.install(m, REPO, cfg)
 
     stale = cfg / "commands" / "stale-ghost.md"
     stale.parent.mkdir(parents=True, exist_ok=True)
-    stale.symlink_to(REPO / "src" / "commands" / "fix.md")
+    stale.symlink_to(REPO / "content" / "commands" / "fix.md")
 
     operations.sync(m, REPO, cfg, prune=False)
     assert stale.exists()  # stale symlink left in place when pruning disabled
@@ -239,14 +340,45 @@ def test_sync_prune_false_keeps_stale(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- uninstall
 def test_uninstall_removes_managed_only(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
-    m = manifest.load(MANIFEST)
+    cfg = config.opencode_config_dir({})
+    m = manifest.load(MANIFEST_PATH)
     operations.install(m, REPO, cfg)
     user = cfg / "commands" / "my-own.md"
     user.write_text("keep me")
     operations.uninstall(m, REPO, cfg)
     assert user.exists()
     assert not (cfg / "commands" / "commit-message.md").exists()
+    assert not (cfg / state.STATE_FILE).exists()
+
+
+def test_uninstall_keeps_symlinks_to_siblings_of_content(tmp_path):
+    root = tmp_path / "repo"
+    content = root / "content" / "commands"
+    content.mkdir(parents=True)
+    (content / "fix.md").write_text("managed\n")
+    sibling = root / "content-backup" / "commands"
+    sibling.mkdir(parents=True)
+    (sibling / "fix.md").write_text("user\n")
+    numeric = root / "content2"
+    numeric.mkdir()
+    (numeric / "fix.md").write_text("user\n")
+
+    cfg = tmp_path / "cfg"
+    commands = cfg / "commands"
+    commands.mkdir(parents=True)
+    managed = commands / "managed.md"
+    managed.symlink_to(content / "fix.md")
+    backup = commands / "backup.md"
+    backup.symlink_to(sibling / "fix.md")
+    other = commands / "other.md"
+    other.symlink_to(numeric / "fix.md")
+
+    removed = operations.uninstall({"artifacts": []}, root, cfg)
+
+    assert removed == 1
+    assert not managed.exists()
+    assert backup.is_symlink()
+    assert other.is_symlink()
 
 
 def test_uninstall_removes_legacy_copy_of_plain_symlink(tmp_path, monkeypatch):
@@ -255,7 +387,7 @@ def test_uninstall_removes_legacy_copy_of_plain_symlink(tmp_path, monkeypatch):
     # matches the source exactly, but keeps a user-edited file at the same
     # kind of target.
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     root = tmp_path / "root"
 
     src = root / "src" / "scripts" / "verify.sh"
@@ -504,38 +636,38 @@ def test_check_valid_source_path_reports_behind(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------- entrypoint
 def test_oc_entrypoint_paths_resolve_to_repo():
-    import kit  # noqa: PLC0415
+    import rivet  # noqa: PLC0415
 
-    # Guards the CLI entrypoint against ROOT/MANIFEST regressions: an off-by-one
-    # ROOT or a wrong manifest filename makes every subcommand fail.
-    assert kit.ROOT == REPO
-    assert kit.MANIFEST == REPO / "manifest.toml"
-    assert kit.MANIFEST.exists()
+    # Guards the CLI entrypoint against ROOT_PATH/MANIFEST_PATH regressions: an off-by-one
+    # ROOT_PATH or a wrong manifest filename makes every subcommand fail.
+    assert rivet.ROOT_PATH == REPO
+    assert rivet.MANIFEST_PATH == REPO / "manifest.toml"
+    assert rivet.MANIFEST_PATH.exists()
 
 
-def test_oc_cli_install_dispatch(tmp_path, monkeypatch):
+def test_cli_init_dispatch(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    import kit  # noqa: PLC0415
+    monkeypatch.setattr(rivet, "_bootstrap_shell_command", lambda: None)
 
-    # --no-init: keep this test hermetic. Per-project init (OpenSpec,
+    # --no-project: keep this test hermetic. Per-project init (OpenSpec,
     # codebase-memory-mcp) would mutate the real working tree and PATH tools.
-    assert kit.main(["install", "--yes", "--no-init", "--agent", "opencode"]) == 0
+    assert rivet.main(["init", "--no-project"]) == 0
     cfg = tmp_path / "cfg"
     assert (cfg / "AGENTS.md").exists()
     assert (cfg / "commands" / "commit-message.md").exists()
 
 
-def test_oc_cli_missing_manifest_returns_error(tmp_path, monkeypatch, capsys):
+def test_cli_missing_manifest_returns_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    import kit  # noqa: PLC0415
+    import rivet  # noqa: PLC0415
 
     # A manifest we cannot find must fail cleanly (exit 2), not traceback.
-    original = kit.MANIFEST
-    kit.MANIFEST = tmp_path / "nope.toml"
+    original = rivet.MANIFEST_PATH
+    rivet.MANIFEST_PATH = tmp_path / "nope.toml"
     try:
-        assert kit.main(["install", "--yes"]) == 2
+        assert rivet.main(["init", "--no-project"]) == 2
     finally:
-        kit.MANIFEST = original
+        rivet.MANIFEST_PATH = original
     assert "manifest not found" in capsys.readouterr().err
 
 
@@ -647,7 +779,7 @@ def _replace_artifact() -> dict:
 
 def test_replace_upgrade_from_symlink_does_not_clobber_source(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     root = tmp_path / "root"
     src = root / "src" / "commands" / "cmd.md"
     src.parent.mkdir(parents=True)
@@ -668,7 +800,7 @@ def test_replace_upgrade_from_symlink_does_not_clobber_source(tmp_path, monkeypa
 
 def test_replace_copy_honors_force(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     root = tmp_path / "root"
     src = root / "src" / "commands" / "cmd.md"
     src.parent.mkdir(parents=True)
@@ -684,9 +816,73 @@ def test_replace_copy_honors_force(tmp_path, monkeypatch):
     assert f"{cfg}/scripts/run.sh" in target.read_text()  # overwritten
 
 
+def test_replace_copy_force_backs_up_user_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    root = tmp_path / "root"
+    src = root / "src" / "commands" / "cmd.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("run <SCRIPT>\n")
+
+    target = cfg / "commands" / "cmd.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("USER FILE\n")
+
+    operations.symlink(root, cfg, _replace_artifact(), force=True)
+
+    backups = list((cfg / state.BACKUP_DIR).rglob("cmd.md"))
+    assert backups
+    assert backups[0].read_text() == "USER FILE\n"
+
+
+def test_force_symlink_backs_up_user_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    root = tmp_path / "root"
+    src = root / "content" / "skills" / "demo" / "SKILL.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("managed\n")
+    artifact = {
+        "name": "demo",
+        "operation": "symlink",
+        "src": "content/skills/demo",
+        "target": "skills/demo",
+    }
+
+    target = cfg / "skills" / "demo"
+    target.mkdir(parents=True)
+    (target / "NOTES.md").write_text("user notes\n")
+
+    operations.symlink(root, cfg, artifact, force=True)
+
+    assert target.is_symlink()
+    backups = list((cfg / state.BACKUP_DIR).rglob("NOTES.md"))
+    assert backups
+    assert backups[0].read_text() == "user notes\n"
+
+
+def test_replace_copy_refreshes_after_source_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    root = tmp_path / "root"
+    src = root / "src" / "commands" / "cmd.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("old run <SCRIPT>\n")
+
+    operations.symlink(root, cfg, _replace_artifact())
+    target = cfg / "commands" / "cmd.md"
+    assert "old run" in target.read_text()
+
+    src.write_text("new run <SCRIPT>\n")
+    operations.symlink(root, cfg, _replace_artifact())
+
+    assert "new run" in target.read_text()
+    assert "old run" not in target.read_text()
+
+
 def test_replace_copy_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     root = tmp_path / "root"
     src = root / "src" / "commands" / "cmd.md"
     src.parent.mkdir(parents=True)
@@ -700,7 +896,7 @@ def test_replace_copy_idempotent(tmp_path, monkeypatch):
 
 def test_uninstall_keeps_user_file_at_replace_target(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     root = tmp_path / "root"
     src = root / "src" / "commands" / "cmd.md"
     src.parent.mkdir(parents=True)
@@ -724,12 +920,31 @@ def test_uninstall_keeps_user_file_at_replace_target(tmp_path, monkeypatch):
     assert not target.exists()
 
 
+def test_uninstall_keeps_user_file_that_mentions_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
+    cfg = config.opencode_config_dir({})
+    root = tmp_path / "root"
+    src = root / "src" / "commands" / "cmd.md"
+    src.parent.mkdir(parents=True)
+    src.write_text("run <SCRIPT>\n")
+
+    artifact = _replace_artifact()
+    manifest = {"version": 2, "artifacts": [artifact]}
+
+    target = cfg / "commands" / "cmd.md"
+    target.parent.mkdir(parents=True)
+    target.write_text(f"my own file mentions {cfg}/scripts/run.sh\n")
+
+    operations.uninstall(manifest, root, cfg)
+    assert target.exists()
+
+
 def test_uninstall_removes_stale_substituted_copy(tmp_path, monkeypatch):
     # A substituted copy installed from an older source must still be removed
     # when the repo source drifted since install. It embeds the tool's
     # resolved config-dir path, which marks it as managed.
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     root = tmp_path / "root"
     src = root / "src" / "commands" / "cmd.md"
     src.parent.mkdir(parents=True)
@@ -751,7 +966,7 @@ def test_uninstall_removes_stale_substituted_copy(tmp_path, monkeypatch):
 # ---------------------------------------------------- config_merge guards
 def test_config_merge_refuses_unparseable_config(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     target = cfg / "opencode.json"
     target.parent.mkdir(parents=True)
     target.write_text("{ not json !! }\n")
@@ -765,7 +980,7 @@ def test_config_merge_refuses_unparseable_config(tmp_path, monkeypatch):
 
 def test_config_merge_refuses_non_object_config(tmp_path, monkeypatch):
     monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "cfg"))
-    cfg = config.config_dir("opencode", {})
+    cfg = config.opencode_config_dir({})
     target = cfg / "opencode.json"
     target.parent.mkdir(parents=True)
     target.write_text("[1, 2, 3]\n")
@@ -824,50 +1039,6 @@ def test_validate_rejects_non_string_config_value():
         manifest.validate(data)
 
 
-def test_config_merge_yaml_sets_theme_and_is_idempotent(tmp_path):
-    cfg = tmp_path / "omp"
-    cfg.mkdir()
-    target = cfg / "config.yml"
-    target.write_text(
-        "enabledModels:\n"
-        "  - deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731\n"
-        "theme:\n"
-        "  dark: other\n"
-        "setupVersion: 2\n"
-    )
-    artifact = {"config_file": "config.yml", "config_path": "theme.dark",
-                "value": '"github-dark"'}
-    operations.config_merge(Path("."), cfg, artifact)
-    assert target.read_text() == (
-        "enabledModels:\n"
-        "  - deepinfra/deepseek-ai/DeepSeek-V4-Flash-0731\n"
-        "theme:\n"
-        "  dark: github-dark\n"
-        "setupVersion: 2\n"
-    )
-    # idempotent: a second run leaves the file unchanged
-    before = target.read_text()
-    operations.config_merge(Path("."), cfg, artifact)
-    assert target.read_text() == before
-
-
-def test_config_merge_yaml_inserts_missing_theme_block(tmp_path):
-    cfg = tmp_path / "omp"
-    cfg.mkdir()
-    target = cfg / "config.yml"
-    target.write_text("setupVersion: 2\n")
-    operations.config_merge(Path("."), cfg, artifact := {
-        "config_file": "config.yml", "config_path": "theme.dark",
-        "value": '"github-dark"',
-    })
-    assert target.read_text() == (
-        "setupVersion: 2\n"
-        "\n"
-        "theme:\n"
-        "  dark: github-dark\n"
-    )
-
-
 # ------------------------------------------------------------------ project
 def test_git_root_resolves_toplevel_from_subdir(tmp_path):
     git("init", cwd=tmp_path)
@@ -897,13 +1068,24 @@ def test_prepend_instruction_is_idempotent(tmp_path):
     project._prepend_instruction(root, src)
     assert (root / "AGENTS.md").read_text() == first
 
+    src.write_text(
+        "<!-- codebase-memory-mcp:start -->\n# new block\n"
+        "<!-- codebase-memory-mcp:end -->\n"
+    )
+    project._prepend_instruction(root, src)
+    updated = (root / "AGENTS.md").read_text()
+    assert "# new block" in updated
+    assert "# block" not in updated
+    assert updated.endswith("existing\n")
+    assert updated.count("codebase-memory-mcp:start") == 1
+
 
 def test_install_plugin(tmp_path):
-    src = tmp_path / "CodebaseMemoryReminder.oc.ts"
+    src = tmp_path / "CodebaseMemoryReminder.ts"
     src.write_text("// plugin")
     root = tmp_path / "proj"
     root.mkdir()
-    project._install_plugin(root, Path(".opencode") / "plugins", src)
+    project._install_plugin(root, src)
     assert (root / ".opencode" / "plugins" / "CodebaseMemoryReminder.ts").read_text() == (
         "// plugin"
     )
@@ -951,7 +1133,7 @@ def test_merge_mcp_config_upgrades_kit_legacy_entry(tmp_path):
     project._merge_mcp_config(root, "/bin/cbm")
     data = json.loads((root / ".opencode" / "opencode.json").read_text())
     assert "codebase-memory-mcp" not in data["mcp"]
-    assert data["mcp"]["servers"]["codebase-memory-mcp"]["command"] == ["/old/cbm"]
+    assert data["mcp"]["servers"]["codebase-memory-mcp"]["command"] == ["/bin/cbm"]
 
 
 def test_merge_mcp_config_preserves_user_entry(tmp_path):
@@ -966,21 +1148,154 @@ def test_merge_mcp_config_preserves_user_entry(tmp_path):
     assert "servers" not in data["mcp"]
 
 
+def test_merge_mcp_config_preserves_custom_v2_entry(tmp_path):
+    root = tmp_path / "proj"
+    (root / ".opencode").mkdir(parents=True)
+    entry = {
+        "type": "local",
+        "command": ["npx", "-y", "codebase-memory-mcp"],
+        "environment": {"TOKEN": "secret"},
+    }
+    (root / ".opencode" / "opencode.json").write_text(
+        json.dumps({"mcp": {"servers": {"codebase-memory-mcp": entry}}})
+    )
+
+    project._merge_mcp_config(root, "/bin/codebase-memory-mcp")
+
+    data = json.loads((root / ".opencode" / "opencode.json").read_text())
+    assert data["mcp"]["servers"]["codebase-memory-mcp"] == entry
+
+
+def test_merge_mcp_config_refreshes_moved_binary(tmp_path):
+    root = tmp_path / "proj"
+    (root / ".opencode").mkdir(parents=True)
+    (root / ".opencode" / "opencode.json").write_text(
+        json.dumps(
+            {
+                "mcp": {
+                    "servers": {
+                        "codebase-memory-mcp": {
+                            "type": "local",
+                            "command": ["/old/codebase-memory-mcp"],
+                        }
+                    }
+                }
+            }
+        )
+    )
+
+    project._merge_mcp_config(root, "/new/codebase-memory-mcp")
+
+    data = json.loads((root / ".opencode" / "opencode.json").read_text())
+    assert data["mcp"]["servers"]["codebase-memory-mcp"]["command"] == [
+        "/new/codebase-memory-mcp"
+    ]
+
+
+def test_merge_mcp_config_reads_jsonc(tmp_path):
+    root = tmp_path / "proj"
+    directory = root / ".opencode"
+    directory.mkdir(parents=True)
+    config = directory / "opencode.jsonc"
+    config.write_text(
+        '{\n'
+        '  // project config\n'
+        '  "theme": "x",\n'
+        '  "mcp": {"servers": {"other": {"type": "local", "command": ["x"]}}},\n'
+        '}\n'
+    )
+
+    project._merge_mcp_config(root, "/bin/cbm")
+
+    data = json.loads(jsonc.strip_jsonc(config.read_text()))
+    assert data["theme"] == "x"
+    assert data["mcp"]["servers"]["other"] == {"type": "local", "command": ["x"]}
+    assert data["mcp"]["servers"]["codebase-memory-mcp"] == {
+        "type": "local",
+        "command": ["/bin/cbm"],
+    }
+    assert not (directory / "opencode.json").exists()
+
+
+def test_merge_mcp_config_prefers_existing_jsonc(tmp_path):
+    root = tmp_path / "proj"
+    directory = root / ".opencode"
+    directory.mkdir(parents=True)
+    jsonc_config = directory / "opencode.jsonc"
+    jsonc_config.write_text('{\n  // keep me\n  "theme": "jsonc"\n}\n')
+    json_config = directory / "opencode.json"
+    json_config.write_text('{"theme": "json"}\n')
+
+    project._merge_mcp_config(root, "/bin/cbm")
+
+    data = json.loads(jsonc.strip_jsonc(jsonc_config.read_text()))
+    assert data["mcp"]["servers"]["codebase-memory-mcp"]["command"] == ["/bin/cbm"]
+    assert json_config.read_text() == '{"theme": "json"}\n'
+
+
+def test_mcp_entry_present_reads_jsonc(tmp_path):
+    root = tmp_path / "proj"
+    directory = root / ".opencode"
+    directory.mkdir(parents=True)
+    (directory / "opencode.jsonc").write_text(
+        '{\n  // project config\n'
+        '  "mcp": {"servers": {"codebase-memory-mcp": '
+        '{"type": "local", "command": ["/bin/cbm"]}}}\n}\n'
+    )
+
+    assert project.mcp_entry_present(root)
+
+
+def test_uninstall_project_removes_entry_from_jsonc(tmp_path):
+    root = tmp_path / "proj"
+    directory = root / ".opencode"
+    directory.mkdir(parents=True)
+    config = directory / "opencode.jsonc"
+    config.write_text(
+        '{\n  // project config\n'
+        '  "theme": "x",\n'
+        '  "mcp": {"servers": {"codebase-memory-mcp": '
+        '{"type": "local", "command": ["/bin/codebase-memory-mcp"]}}}\n}\n'
+    )
+
+    project.uninstall_project(root, tmp_path / "missing.ts")
+
+    data = json.loads(jsonc.strip_jsonc(config.read_text()))
+    assert data["theme"] == "x"
+    assert "codebase-memory-mcp" not in data["mcp"]["servers"]
+    assert not (directory / "opencode.json").exists()
+
+
+def test_uninstall_keeps_custom_mcp_entry(tmp_path):
+    root = tmp_path / "proj"
+    (root / ".opencode").mkdir(parents=True)
+    entry = {
+        "type": "local",
+        "command": ["npx", "-y", "codebase-memory-mcp"],
+        "environment": {"TOKEN": "secret"},
+    }
+    config = root / ".opencode" / "opencode.json"
+    config.write_text(
+        json.dumps({"mcp": {"servers": {"codebase-memory-mcp": entry}}})
+    )
+
+    project.uninstall_project(root, tmp_path / "missing.ts")
+
+    data = json.loads(config.read_text())
+    assert data["mcp"]["servers"]["codebase-memory-mcp"] == entry
+
+
 def test_init_project_skips_outside_repo(tmp_path):
     # Not a git repo: init must no-op without invoking any tool.
     calls = []
     confirm = lambda prompt: calls.append(prompt) or True  # noqa: E731
-    project.init_project(
-        tmp_path, confirm, tmp_path / "no.md", tmp_path / "no.ts", tmp_path / "no.omp.ts", "opencode"
-    )
+    project.init_project(tmp_path, confirm, tmp_path / "no.md", tmp_path / "no.ts")
     assert calls == []
     assert not (tmp_path / "AGENTS.md").exists()
     assert not (tmp_path / ".opencode").exists()
 
 
-def test_init_openspec_uses_omp_tools(tmp_path, monkeypatch):
-    # OpenSpec must be initialized for Oh My Pi with its own `--tools` value,
-    # not the opencode one.
+def test_init_openspec_uses_opencode_tools(tmp_path, monkeypatch):
     root = tmp_path / "proj"
     root.mkdir()
     calls = []
@@ -988,22 +1303,8 @@ def test_init_openspec_uses_omp_tools(tmp_path, monkeypatch):
         project.subprocess, "run",
         lambda cmd, **kw: calls.append(cmd) or _ok_run(cmd, **kw),
     )
-    project._init_openspec(root, "/bin/openspec", "omp")
-    assert calls[0] == ["/bin/openspec", "init", "--tools", "oh-my-pi"]
-
-
-def test_omp_install_dispatches_project_init(tmp_path, monkeypatch):
-    # `setup install --agent omp` must reach per-project init (OpenSpec) for
-    # Oh My Pi, not silently skip it.
-    calls = []
-    monkeypatch.setattr(kit.operations, "sync", lambda *a, **k: None)
-    monkeypatch.setattr(kit.project, "init_project", lambda *a, **k: calls.append(a))
-    monkeypatch.setattr(kit, "_bootstrap_shell_command", lambda: None)
-    kit._run_install(
-        manifest.load(MANIFEST), tmp_path, force=True, assume_yes=True,
-        skip_init=False, agent="omp",
-    )
-    assert calls, "omp install must call per-project init"
+    project._init_openspec(root, "/bin/openspec")
+    assert calls[0] == ["/bin/openspec", "init", "--tools", "opencode"]
 
 
 def _write_instruction(tmp_path) -> Path:
@@ -1012,98 +1313,6 @@ def _write_instruction(tmp_path) -> Path:
         "<!-- codebase-memory-mcp:start -->\n# block\n<!-- codebase-memory-mcp:end -->\n"
     )
     return src
-
-
-def _write_omp_plugin(tmp_path) -> Path:
-    plugin = tmp_path / "CodebaseMemoryReminder.omp.ts"
-    plugin.write_text("// omp reminder extension\n")
-    return plugin
-
-
-def test_omp_init_writes_mcp_json(tmp_path, monkeypatch):
-    root = tmp_path / "proj"
-    root.mkdir()
-    monkeypatch.setattr(project.subprocess, "run", _ok_run)
-    monkeypatch.setattr(project, "OMP_USER_MCP", tmp_path / "user" / "mcp.json")
-    project._init_codebase_omp(root, "/bin/cbm", _write_instruction(tmp_path), _write_omp_plugin(tmp_path), lambda p: True)
-    data = json.loads((root / ".omp" / "mcp.json").read_text())
-    assert data["mcpServers"]["codebase-memory-mcp"] == {
-        "enabled": True,
-        "command": "/bin/cbm",
-    }
-
-
-def test_omp_init_installs_extension_and_instruction(tmp_path, monkeypatch):
-    root = tmp_path / "proj"
-    root.mkdir()
-    monkeypatch.setattr(project.subprocess, "run", _ok_run)
-    monkeypatch.setattr(project, "OMP_USER_MCP", tmp_path / "user" / "mcp.json")
-    project._init_codebase_omp(root, "/bin/cbm", _write_instruction(tmp_path), _write_omp_plugin(tmp_path), lambda p: True)
-    assert (
-        root / ".omp" / "extensions" / "CodebaseMemoryReminder.ts"
-    ).read_text() == "// omp reminder extension\n"
-    assert (root / "AGENTS.md").read_text().startswith("<!-- codebase-memory-mcp:start -->")
-
-
-def test_omp_init_does_not_touch_opencode(tmp_path, monkeypatch):
-    root = tmp_path / "proj"
-    root.mkdir()
-    monkeypatch.setattr(project.subprocess, "run", _ok_run)
-    monkeypatch.setattr(project, "OMP_USER_MCP", tmp_path / "user" / "mcp.json")
-    project._init_codebase_omp(root, "/bin/cbm", _write_instruction(tmp_path), _write_omp_plugin(tmp_path), lambda p: True)
-    assert not (root / ".opencode").exists()
-
-
-def test_omp_denylist_accept_removes_entry(tmp_path, monkeypatch, capsys):
-    user_mcp = tmp_path / "user" / "mcp.json"
-    user_mcp.parent.mkdir(parents=True)
-    user_mcp.write_text(json.dumps({"disabledServers": ["codebase-memory-mcp"]}))
-    root = tmp_path / "proj"
-    root.mkdir()
-    monkeypatch.setattr(project.subprocess, "run", _ok_run)
-    monkeypatch.setattr(project, "OMP_USER_MCP", user_mcp)
-    calls = []
-    project._init_codebase_omp(
-        root, "/bin/cbm", _write_instruction(tmp_path), _write_omp_plugin(tmp_path),
-        lambda p: calls.append(p) or True,
-    )
-    assert calls, "denylist entry must prompt"
-    data = json.loads(user_mcp.read_text())
-    assert "codebase-memory-mcp" not in data["disabledServers"]
-
-
-def test_omp_denylist_decline_reports_unavailable(tmp_path, monkeypatch, capsys):
-    user_mcp = tmp_path / "user" / "mcp.json"
-    user_mcp.parent.mkdir(parents=True)
-    user_mcp.write_text(json.dumps({"disabledServers": ["codebase-memory-mcp"]}))
-    root = tmp_path / "proj"
-    root.mkdir()
-    monkeypatch.setattr(project.subprocess, "run", _ok_run)
-    monkeypatch.setattr(project, "OMP_USER_MCP", user_mcp)
-    project._init_codebase_omp(
-        root, "/bin/cbm", _write_instruction(tmp_path), _write_omp_plugin(tmp_path),
-        lambda p: False,
-    )
-    data = json.loads(user_mcp.read_text())
-    assert "codebase-memory-mcp" in data["disabledServers"]  # untouched
-    assert "unavailable" in capsys.readouterr().out
-
-
-def test_omp_init_is_idempotent(tmp_path, monkeypatch):
-    root = tmp_path / "proj"
-    root.mkdir()
-    monkeypatch.setattr(project.subprocess, "run", _ok_run)
-    monkeypatch.setattr(project, "OMP_USER_MCP", tmp_path / "user" / "mcp.json")
-    plugin = _write_omp_plugin(tmp_path)
-    instruction = _write_instruction(tmp_path)
-    project._init_codebase_omp(root, "/bin/cbm", instruction, plugin, lambda p: True)
-    mcp_before = (root / ".omp" / "mcp.json").read_text()
-    ext_before = (root / ".omp" / "extensions" / "CodebaseMemoryReminder.ts").read_text()
-    agents_before = (root / "AGENTS.md").read_text()
-    project._init_codebase_omp(root, "/bin/cbm", instruction, plugin, lambda p: True)
-    assert (root / ".omp" / "mcp.json").read_text() == mcp_before
-    assert (root / ".omp" / "extensions" / "CodebaseMemoryReminder.ts").read_text() == ext_before
-    assert (root / "AGENTS.md").read_text() == agents_before
 
 
 def _R(code, stdout=""):
@@ -1125,7 +1334,7 @@ def test_initial_index_skips_when_indexed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(project.subprocess, "run", lambda cmd, **kw: calls.append(" ".join(cmd)) or _R(0))
     project._initial_index(root, "/bin/cbm")
     assert not any("index_repository" in c for c in calls)
-    assert "already indexed" in capsys.readouterr().out
+    assert capsys.readouterr().out == ""
 
 
 def test_initial_index_indexes_when_not_indexed(tmp_path, monkeypatch, capsys):
@@ -1143,7 +1352,7 @@ def test_initial_index_indexes_when_not_indexed(tmp_path, monkeypatch, capsys):
     status_calls = [c for c in calls if "index_status" in c]
     assert status_calls
     assert str(root.resolve()).lstrip("/").replace("/", "-") in status_calls[0]
-    assert "indexed" in capsys.readouterr().out
+    assert "Indexing" in capsys.readouterr().out
 
 
 def test_initial_index_warns_on_failure(tmp_path, monkeypatch, capsys):
@@ -1151,7 +1360,7 @@ def test_initial_index_warns_on_failure(tmp_path, monkeypatch, capsys):
     root.mkdir()
     monkeypatch.setattr(project.subprocess, "run", _index_subprocess(1, 1))
     project._initial_index(root, "/bin/cbm")  # must not raise
-    assert "warning" in capsys.readouterr().out
+    assert "graph may be empty" in capsys.readouterr().out
 
 
 def _fake_init_run(root, indexed):
@@ -1164,22 +1373,20 @@ def _fake_init_run(root, indexed):
     return run
 
 
-def test_init_project_indexes_shared_across_agents(tmp_path, monkeypatch):
+def test_init_project_indexes_repository(tmp_path, monkeypatch):
     root = tmp_path / "proj"
     root.mkdir()
     git("init", cwd=root)
     calls = []
     monkeypatch.setattr(project, "_ensure_tool", lambda *a, **k: "/bin/cbm")
-    monkeypatch.setattr(project, "_init_openspec", lambda *a, **k: None)
+    monkeypatch.setattr(project, "_init_openspec", lambda *a, **k: True)
     monkeypatch.setattr(project, "_init_codebase", lambda *a, **k: None)
-    monkeypatch.setattr(project, "_init_codebase_omp", lambda *a, **k: None)
     monkeypatch.setattr(
         project.subprocess, "run",
         lambda cmd, **kw: calls.append(" ".join(cmd)) or _fake_init_run(root, False)(cmd, **kw),
     )
-    project.init_project(root, lambda p: True, tmp_path / "i.md", tmp_path / "oc.ts", tmp_path / "omp.ts", "opencode")
-    project.init_project(root, lambda p: True, tmp_path / "i.md", tmp_path / "oc.ts", tmp_path / "omp.ts", "omp")
-    assert sum(1 for c in calls if "index_status" in c) == 2  # reached for both agents
+    project.init_project(root, lambda p: True, tmp_path / "i.md", tmp_path / "oc.ts")
+    assert sum(1 for c in calls if "index_status" in c) == 1
 
 
 def test_init_project_idempotent_skips_index(tmp_path, monkeypatch):
@@ -1188,14 +1395,13 @@ def test_init_project_idempotent_skips_index(tmp_path, monkeypatch):
     git("init", cwd=root)
     calls = []
     monkeypatch.setattr(project, "_ensure_tool", lambda *a, **k: "/bin/cbm")
-    monkeypatch.setattr(project, "_init_openspec", lambda *a, **k: None)
+    monkeypatch.setattr(project, "_init_openspec", lambda *a, **k: True)
     monkeypatch.setattr(project, "_init_codebase", lambda *a, **k: None)
-    monkeypatch.setattr(project, "_init_codebase_omp", lambda *a, **k: None)
     monkeypatch.setattr(
         project.subprocess, "run",
         lambda cmd, **kw: calls.append(" ".join(cmd)) or _fake_init_run(root, True)(cmd, **kw),
     )
-    project.init_project(root, lambda p: True, tmp_path / "i.md", tmp_path / "oc.ts", tmp_path / "omp.ts", "opencode")
+    project.init_project(root, lambda p: True, tmp_path / "i.md", tmp_path / "oc.ts")
     assert not any("index_repository" in c for c in calls)
 
 
@@ -1210,120 +1416,68 @@ def test_ensure_tool_prompts_with_command_and_skips_on_decline(tmp_path, monkeyp
     assert "echo install it" in calls[0]
 
 
-# ------------------------------------------------------------- multi-agent
-def test_detect_agents_both(monkeypatch):
-    monkeypatch.setattr(
-        shutil, "which",
-        lambda name: f"/usr/bin/{name}" if name in ("opencode", "omp") else None,
+def _timeout_run(cmd, **kwargs):
+    raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+
+
+def test_run_checked_times_out(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(project.subprocess, "run", _timeout_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        project._run_checked(["/bin/slow"], cwd=tmp_path)
+    assert "timed out" in capsys.readouterr().out
+
+
+def test_init_openspec_reports_timeout(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+
+    monkeypatch.setattr(project.subprocess, "run", run)
+
+    assert project._init_openspec(tmp_path, "/bin/openspec") is False
+    assert seen["timeout"] == project.COMMAND_TIMEOUT
+    assert "OpenSpec" in capsys.readouterr().out
+
+
+def test_set_runtime_flags_warns_on_timeout(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(project.subprocess, "run", _timeout_run)
+
+    assert project._set_runtime_flags(tmp_path, "/bin/cbm") is False
+    out = capsys.readouterr().out
+    assert "auto_index" in out
+
+
+def test_ensure_tool_times_out_with_visible_output(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PATH", str(tmp_path))
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 1))
+
+    monkeypatch.setattr(project.subprocess, "run", run)
+
+    result = project._ensure_tool(
+        "FakeTool", "fake-bin-xyz", "echo install it", lambda prompt: True
     )
-    assert config.detect_agents() == ["opencode", "omp"]
+
+    assert result is None
+    assert seen["timeout"] == project.INSTALL_TIMEOUT
+    assert not seen.get("capture_output")
+    assert "timed out" in capsys.readouterr().out
 
 
-def test_detect_agents_none(monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    assert config.detect_agents() == []
+def test_initial_index_times_out(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "proj"
+    root.mkdir()
+    monkeypatch.setattr(project, "is_indexed", lambda *args, **kwargs: False)
+    monkeypatch.setattr(project.subprocess, "run", _timeout_run)
 
-
-def test_config_dir_omp_fallback(monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    assert config.config_dir("omp", {}) == Path.home() / ".omp" / "agent"
-
-
-def test_config_dir_unknown_agent():
-    with pytest.raises(ValueError):
-        config.config_dir("nope", {})
-
-
-def test_select_agents_force_flag(monkeypatch):
-    monkeypatch.setattr(
-        shutil, "which",
-        lambda name: f"/x/{name}" if name in ("opencode", "omp") else None,
-    )
-    assert kit.select_agents("omp") == "omp"
-
-
-def test_select_agents_single_detected(monkeypatch):
-    monkeypatch.setattr(
-        shutil, "which", lambda name: "/x/opencode" if name == "opencode" else None
-    )
-    assert kit.select_agents(None) == "opencode"
-
-
-def test_select_agents_none_detected(monkeypatch):
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    assert kit.select_agents(None) is None
-
-
-def test_select_agents_multiple_prompts(monkeypatch):
-    monkeypatch.setattr(
-        shutil, "which",
-        lambda name: f"/x/{name}" if name in ("opencode", "omp") else None,
-    )
-    # explicit single choice
-    monkeypatch.setattr("builtins.input", lambda prompt: "1")
-    assert kit.select_agents(None) == "opencode"
-    monkeypatch.setattr("builtins.input", lambda prompt: "2")
-    assert kit.select_agents(None) == "omp"
-
-
-def test_select_agents_prompt_rejects_invalid(monkeypatch):
-    monkeypatch.setattr(
-        shutil, "which",
-        lambda name: f"/x/{name}" if name in ("opencode", "omp") else None,
-    )
-    replies = iter(["abc", "9", "1"])
-    monkeypatch.setattr("builtins.input", lambda prompt: next(replies))
-    assert kit.select_agents(None) == "opencode"
-
-
-def test_select_agents_prompt_uses_command_verb(monkeypatch):
-    # The multi-agent prompt must name the operation being run, so `uninstall`
-    # asks "Uninstall for which?" rather than the install-specific text.
-    monkeypatch.setattr(
-        shutil, "which",
-        lambda name: f"/x/{name}" if name in ("opencode", "omp") else None,
-    )
-    prompts = []
-    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "1")
-    kit.select_agents(None, command="uninstall")
-    assert any("Uninstall for which?" in p for p in prompts)
-    prompts.clear()
-    kit.select_agents(None, command="install")
-    assert any("Install for which?" in p for p in prompts)
-
-
-def test_install_scopes_artifacts_by_agent(tmp_path, monkeypatch):
-    monkeypatch.setenv("OC_CONFIG_DIR", str(tmp_path / "oc"))
-    oc_dir = config.config_dir("opencode", {})
-    omp_dir = tmp_path / "omp"
-    root = tmp_path / "root"
-    src = root / "src" / "commands" / "cmd.md"
-    src.parent.mkdir(parents=True)
-    src.write_text("shared\n")
-    oc_src = root / "src" / "themes" / "t.json"
-    oc_src.parent.mkdir(parents=True)
-    oc_src.write_text('{"a": 1}\n')
-
-    manifest = {
-        "version": 2,
-        "artifacts": [
-            {"name": "shared", "operation": "symlink", "provenance": "original",
-             "agents": ["opencode", "omp"], "src": "src/commands/cmd.md",
-             "target": "commands/cmd.md"},
-            {"name": "oconly", "operation": "symlink", "provenance": "original",
-             "agents": ["opencode"], "src": "src/themes/t.json",
-             "target": "themes/t.json"},
-        ],
-    }
-    operations.install(manifest, root, oc_dir)
-    operations.install(manifest, root, omp_dir, agent="omp")
-
-    # shared installed into both
-    assert (oc_dir / "commands" / "cmd.md").is_symlink()
-    assert (omp_dir / "commands" / "cmd.md").is_symlink()
-    # opencode-only theme in opencode dir but NOT omp dir
-    assert (oc_dir / "themes" / "t.json").is_symlink()
-    assert not (omp_dir / "themes" / "t.json").exists()
+    assert project._initial_index(root, "/bin/cbm") is False
+    assert "timed out" in capsys.readouterr().out
 
 
 def test_validate_requires_agents():
@@ -1362,15 +1516,6 @@ def test_validate_rejects_version_1():
         manifest.validate(data)
 
 
-def test_vendor_accepts_agent_flag():
-    # --agent is accepted for symmetry but vendor ignores it (no config-dir work).
-    args = kit.build_parser().parse_args(["vendor", "--agent", "opencode"])
-    assert args.command == "vendor"
-    assert args.agent == "opencode"
-    args2 = kit.build_parser().parse_args(["vendor", "--agent", "omp"])
-    assert args2.agent == "omp"
-
-
 # ----------------------------------------------------------- shell rc bootstrap
 def test_rc_path_mapping():
     assert shell_rc.rc_path("zsh") == Path.home() / ".zshrc"
@@ -1379,6 +1524,11 @@ def test_rc_path_mapping():
     assert shell_rc.rc_path("tcsh") is None
     assert shell_rc.rc_path(None) is None
     assert shell_rc.rc_path("") is None
+
+
+def test_rc_path_fish_honors_xdg(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert shell_rc.rc_path("fish") == tmp_path / "fish" / "config.fish"
 
 
 def test_login_shell_unknown(monkeypatch):
@@ -1391,65 +1541,309 @@ def test_login_shell_unknown(monkeypatch):
 
 
 def test_bootstrap_block_fish():
-    b = shell_rc.bootstrap_block(Path("/kit/bin/setup"), "fish")
-    assert "function my-ai-code-kit" in b
-    assert "/kit/bin/setup $argv" in b
+    b = shell_rc.bootstrap_block(Path("/kit/bin/rivet"), "fish")
+    assert "function rivet" in b
+    assert "/kit/bin/rivet $argv" in b
 
 
 def test_bootstrap_block_posix():
-    b = shell_rc.bootstrap_block(Path("/kit/bin/setup"), "zsh")
-    assert 'my-ai-code-kit() { /kit/bin/setup "$@"; }' in b
+    b = shell_rc.bootstrap_block(Path("/kit/bin/rivet"), "zsh")
+    assert 'rivet() { /kit/bin/rivet "$@"; }' in b
+
+
+def test_bootstrap_block_quotes_paths_with_spaces():
+    path = Path("/kit dir/bin/rivet")
+    posix = shell_rc.bootstrap_block(path, "zsh")
+    assert "'/kit dir/bin/rivet' \"$@\"" in posix
+    fish = shell_rc.bootstrap_block(path, "fish")
+    assert "'/kit dir/bin/rivet' $argv" in fish
 
 
 def test_add_block_idempotent(tmp_path):
     rc = tmp_path / ".zshrc"
-    block = shell_rc.bootstrap_block(Path("/kit/bin/setup"), "zsh")
+    block = shell_rc.bootstrap_block(Path("/kit/bin/rivet"), "zsh")
     assert shell_rc.add_block(rc, block) is True
     assert shell_rc.add_block(rc, block) is False
-    assert rc.read_text().count("my-ai-code-kit begin") == 1
+    assert rc.read_text().count("rivet begin") == 1
 
 
 def test_remove_block(tmp_path):
     rc = tmp_path / ".zshrc"
     rc.write_text("export FOO=1\n")
-    block = shell_rc.bootstrap_block(Path("/kit/bin/setup"), "zsh")
+    block = shell_rc.bootstrap_block(Path("/kit/bin/rivet"), "zsh")
     shell_rc.add_block(rc, block)
     assert shell_rc.remove_block(rc) is True
     assert shell_rc.remove_block(rc) is False
     text = rc.read_text()
-    assert "my-ai-code-kit" not in text
+    assert "rivet" not in text
     assert "export FOO=1" in text
 
 
-def test_bootstrap_prompt_decline_writes_nothing(tmp_path, monkeypatch, capsys):
+def test_ensure_block_replaces_after_stray_end_marker(tmp_path):
+    rc = tmp_path / ".zshrc"
+    rc.write_text(
+        "prefix\n"
+        "# <<< rivet end <<<\n"
+        "middle\n"
+        "# >>> rivet begin >>>\n"
+        'rivet() { /old/bin/rivet "$@"; }\n'
+        "# <<< rivet end <<<\n"
+        "suffix\n"
+    )
+    block = shell_rc.bootstrap_block(Path("/new/bin/rivet"), "zsh")
+
+    assert shell_rc.ensure_block(rc, block) == "updated"
+
+    text = rc.read_text()
+    assert text.count("middle") == 1
+    assert "/old/bin/rivet" not in text
+    assert "/new/bin/rivet" in text
+
+
+def test_remove_block_after_stray_end_marker(tmp_path):
+    rc = tmp_path / ".zshrc"
+    rc.write_text(
+        "prefix\n"
+        "# <<< rivet end <<<\n"
+        "middle\n"
+        "# >>> rivet begin >>>\n"
+        'rivet() { /old/bin/rivet "$@"; }\n'
+        "# <<< rivet end <<<\n"
+        "suffix\n"
+    )
+
+    assert shell_rc.remove_block(rc) is True
+
+    text = rc.read_text()
+    assert "rivet begin" not in text
+    assert "/old/bin/rivet" not in text
+    assert text.count("middle") == 1
+    assert "prefix" in text
+    assert "suffix" in text
+
+
+def test_bootstrap_registers_without_tty(tmp_path, monkeypatch, capsys):
     rc = tmp_path / ".zshrc"
     monkeypatch.setattr(shell_rc, "login_shell", lambda: "zsh")
     monkeypatch.setattr(shell_rc, "rc_path", lambda shell: rc)
-    monkeypatch.setattr(kit, "_confirm", lambda prompt, assume_yes=False: False)
-    kit._bootstrap_shell_command()
-    assert not rc.exists()
-    assert "skipped" in capsys.readouterr().out
+    rivet._bootstrap_shell_command()
+    assert "rivet()" in rc.read_text()
+    assert "Shell command" in capsys.readouterr().out
 
 
-def test_bootstrap_accept_writes_block(tmp_path, monkeypatch, capsys):
+def test_bootstrap_is_idempotent(tmp_path, monkeypatch):
     rc = tmp_path / ".zshrc"
     monkeypatch.setattr(shell_rc, "login_shell", lambda: "zsh")
     monkeypatch.setattr(shell_rc, "rc_path", lambda shell: rc)
-    monkeypatch.setattr(kit, "_confirm", lambda prompt, assume_yes=False: True)
-    kit._bootstrap_shell_command()
-    assert "my-ai-code-kit()" in rc.read_text()
-    assert "registered" in capsys.readouterr().out
+    rivet._bootstrap_shell_command()
+    rivet._bootstrap_shell_command()
+    assert rc.read_text().count("rivet begin") == 1
 
 
-def test_bootstrap_runs_even_with_yes(tmp_path, monkeypatch):
-    # The rc bootstrap is a persistent user-controlled change: it is never
-    # bypassed by --yes, so install invokes it regardless of assume_yes.
+def test_bootstrap_updates_stale_block(tmp_path, monkeypatch, capsys):
+    rc = tmp_path / ".zshrc"
+    rc.write_text(shell_rc.bootstrap_block(Path("/old/bin/rivet"), "zsh"))
+    monkeypatch.setattr(shell_rc, "login_shell", lambda: "zsh")
+    monkeypatch.setattr(shell_rc, "rc_path", lambda shell: rc)
+
+    rivet._bootstrap_shell_command()
+
+    text = rc.read_text()
+    assert str(rivet.ROOT_PATH / "bin" / "rivet") in text
+    assert "/old/bin/rivet" not in text
+    assert text.count("rivet begin") == 1
+    assert "exec zsh" in capsys.readouterr().out
+
+
+def test_bootstrap_repairs_incomplete_block(tmp_path, monkeypatch, capsys):
+    rc = tmp_path / ".zshrc"
+    rc.write_text(
+        "export FOO=1\n"
+        "# >>> rivet begin >>>\n"
+        'rivet() { /old/bin/rivet "$@"; }\n'
+    )
+    monkeypatch.setattr(shell_rc, "login_shell", lambda: "zsh")
+    monkeypatch.setattr(shell_rc, "rc_path", lambda shell: rc)
+
+    rivet._bootstrap_shell_command()
+
+    text = rc.read_text()
+    assert "export FOO=1" in text
+    assert str(rivet.ROOT_PATH / "bin" / "rivet") in text
+    assert text.count("rivet begin") == 1
+    assert "rivet end" in text
+    assert "repaired" in capsys.readouterr().out
+
+
+def test_unbootstrap_removes_block_from_any_shell(tmp_path, monkeypatch, capsys):
+    zsh_rc = tmp_path / ".zshrc"
+    zsh_rc.write_text(shell_rc.bootstrap_block(Path("/kit/bin/rivet"), "zsh"))
+    monkeypatch.setattr(shell_rc, "login_shell", lambda: "bash")
+    monkeypatch.setattr(
+        shell_rc, "rc_path", lambda shell: zsh_rc if shell == "zsh" else None
+    )
+    rivet._unbootstrap_shell_command()
+    assert "rivet" not in zsh_rc.read_text()
+    assert "Removed shell command" in capsys.readouterr().out
+
+
+def test_bootstrap_runs_even_with_force(tmp_path, monkeypatch):
+    # Install always registers the short command, regardless of --force.
     calls = []
-    monkeypatch.setattr(kit.operations, "sync", lambda *a, **k: None)
-    monkeypatch.setattr(kit.project, "init_project", lambda *a, **k: None)
-    monkeypatch.setattr(kit, "_bootstrap_shell_command", lambda: calls.append(1))
-    kit._run_install(
-        manifest.load(MANIFEST), tmp_path, force=True, assume_yes=True,
-        skip_init=False, agent="opencode",
+    monkeypatch.setattr(rivet.operations, "sync", lambda *a, **k: {})
+    monkeypatch.setattr(rivet.project, "init_project", lambda *a, **k: None)
+    monkeypatch.setattr(rivet, "_bootstrap_shell_command", lambda: calls.append(1))
+    rivet._run_init(
+        manifest.load(MANIFEST_PATH), tmp_path, tmp_path, force=True,
+        skip_project=False, dry_run=False,
     )
     assert calls == [1]
+
+
+# --------------------------------------------------------- atomic writes
+def _forbid_write_text(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Path.write_text is not crash-safe")
+
+    monkeypatch.setattr(Path, "write_text", forbidden)
+
+
+def test_project_writes_are_atomic(tmp_path, monkeypatch):
+    root = tmp_path / "proj"
+    root.mkdir()
+    first = tmp_path / "first.md"
+    first.write_text("one\n")
+    second = tmp_path / "second.md"
+    second.write_text("two\n")
+    plugin = tmp_path / "plugin.ts"
+    plugin.write_text("plugin\n")
+
+    _forbid_write_text(monkeypatch)
+
+    project._prepend_instruction(root, first)
+    project._prepend_instruction(root, second)
+    project._install_plugin(root, plugin)
+    project.uninstall_project(root, plugin)
+
+
+def test_operations_writes_are_atomic(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    (root / "content").mkdir(parents=True)
+    (root / "content" / "block.md").write_text(
+        "<!-- begin -->\nblock\n<!-- end -->\n"
+    )
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    artifact = {
+        "name": "block",
+        "operation": "text-insert",
+        "src": "content/block.md",
+        "target": "AGENTS.md",
+        "mode": "append",
+        "anchor": "<!-- begin -->",
+        "end_anchor": "<!-- end -->",
+    }
+
+    _forbid_write_text(monkeypatch)
+
+    assert operations.text_insert(root, cfg, artifact) == "installed"
+    assert operations._text_remove(root, cfg, artifact) is True
+    assert operations.config_merge(
+        root,
+        cfg,
+        {"config_file": "opencode.json", "config_path": "a.b", "value": '"x"'},
+    ) == "installed"
+
+
+def test_shell_rc_writes_are_atomic(tmp_path, monkeypatch):
+    rc = tmp_path / ".zshrc"
+    rc.write_text("# user\n")
+    block = shell_rc.bootstrap_block(Path("/bin/rivet"), "zsh")
+
+    _forbid_write_text(monkeypatch)
+
+    assert shell_rc.ensure_block(rc, block) == "installed"
+    newer = shell_rc.bootstrap_block(Path("/opt/rivet"), "zsh")
+    assert shell_rc.ensure_block(rc, newer) == "updated"
+    rc.write_bytes(
+        rc.read_text().replace(shell_rc.MARKER_END + "\n", "").encode()
+    )
+    assert shell_rc.ensure_block(rc, newer) == "repaired"
+    assert shell_rc.remove_block(rc) is True
+    assert shell_rc.ensure_block(rc, newer) == "installed"
+
+
+def test_manifest_writes_are_atomic(tmp_path, monkeypatch):
+    path = tmp_path / "manifest.toml"
+    path.write_text('[[artifacts]]\nname = "x"\nsource_sha = ""\n')
+
+    _forbid_write_text(monkeypatch)
+
+    manifest.set_sha(path, "x", "abc")
+    assert 'source_sha = "abc"' in path.read_text()
+
+
+# ------------------------------------------------------------- tree merges
+def test_copy_tree_rejects_upstream_symlink(tmp_path):
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n")
+    (upstream / "link.md").symlink_to(outside)
+    local = tmp_path / "local"
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        merge._copy_tree(upstream, local)
+    assert not (local / "link.md").exists()
+
+
+def test_merge_tree_rejects_upstream_symlink(tmp_path):
+    base = tmp_path / "base"
+    theirs = tmp_path / "theirs"
+    local = tmp_path / "local"
+    for directory in (base, theirs, local):
+        directory.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n")
+    (theirs / "link.md").symlink_to(outside)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        merge._merge_tree(local, base, theirs)
+
+
+def test_merge_tree_removes_files_deleted_upstream(tmp_path):
+    base = tmp_path / "base"
+    theirs = tmp_path / "theirs"
+    local = tmp_path / "local"
+    for directory in (base, theirs, local):
+        directory.mkdir()
+    for directory in (base, local):
+        (directory / "gone.md").write_text("same\n")
+    for directory in (base, theirs, local):
+        (directory / "keep.md").write_text("same\n")
+    (base / "custom.md").write_text("base\n")
+    (local / "custom.md").write_text("mine\n")
+
+    conflict = merge._merge_tree(local, base, theirs)
+
+    assert conflict is False
+    assert not (local / "gone.md").exists()
+    assert (local / "keep.md").read_text() == "same\n"
+    assert (local / "custom.md").read_text() == "mine\n"
+
+
+def test_merge_tree_preserves_mode_of_new_files(tmp_path):
+    base = tmp_path / "base"
+    theirs = tmp_path / "theirs"
+    local = tmp_path / "local"
+    for directory in (base, theirs, local):
+        directory.mkdir()
+    script = theirs / "script.sh"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+
+    assert merge._merge_tree(local, base, theirs) is False
+    assert (local / "script.sh").read_text() == "#!/bin/sh\n"
+    assert (local / "script.sh").stat().st_mode == script.stat().st_mode
+
+

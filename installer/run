@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+
+# Installer for Rivet (OpenCode, macOS/Linux/WSL).
+#
+# Public entry point:
+#   curl -fsSL https://raw.githubusercontent.com/DuckKota/rivet/main/installer/run | bash
+#
+# When piped there is no checkout to source the split modules from, so this
+# file first bootstraps a clone and re-executes itself from that clone. When
+# run from a checkout it sources the modules and installs directly.
+
+# Bash unofficial strict mode
+set -euo pipefail
+
+REPO_URL="https://github.com/DuckKota/rivet.git"
+# $BASH is the absolute path of the bash running this script
+BASH_BIN="${BASH:-bash}"
+INSTALL_DIR=""
+
+WARNINGS=0
+SHELL_RELOAD=0
+
+# shellcheck disable=SC2034
+DIED=0
+# shellcheck disable=SC2034
+ORIGINAL_DIR=""
+# shellcheck disable=SC2034
+RUN_COMMAND=""
+
+function run::usage
+{
+    cat <<'EOF'
+Usage: installer/run
+
+Install Rivet and its OpenCode integrations.
+Rivet installs to ~/.rivet.
+
+Magic Context is optional. The installer prints its setup command at the end.
+Run it yourself.
+
+Plannotator uses its manual workflow. It runs only when you invoke its
+commands.
+
+Options:
+  -h, --help          Show this help.
+
+Run from a Git repository to also initialize OpenSpec and
+codebase-memory-mcp for that project.
+
+Platforms: macOS, Linux, WSL. Windows Git Bash is not supported.
+EOF
+}
+
+function run::fail
+{
+    printf 'error: %s\n' "$1" >&2
+    exit 1
+}
+
+function run::parse_args
+{
+    local arg
+    for arg in "$@"
+    do
+        case "$arg" in
+            --help|-h) run::usage; exit 0 ;;
+            *) run::fail "unknown argument: $arg (try --help)" ;;
+        esac
+    done
+}
+
+function run::resolve_install_dir
+{
+    # shellcheck disable=SC2034  # read by rivet::install in the sourced steps
+    ORIGINAL_DIR="$(pwd)"
+
+    # INSTALL_DIR is derived from HOME, so validate HOME before building the
+    # path. The result is absolute and keeps a leading "-" out of commands.
+    if [[ -z "${HOME:-}" || "$HOME" != /* ]]
+    then
+        run::fail "HOME must be set to an absolute path"
+    fi
+    INSTALL_DIR="${HOME%/}/.rivet"
+}
+
+function run::require_interactive
+{
+    # -t 1 is true when stdout is a terminal. A `curl | bash` install has a
+    # pipe on stdin but usually still has a terminal on /dev/tty, so prompts
+    # can work. Require both: stdout must be visible, and /dev/tty must open.
+    if [[ ! -t 1 ]] || ! (exec </dev/tty) 2>/dev/null
+    then
+        run::fail "installer requires an interactive terminal. Run it from a terminal."
+    fi
+
+    # Never let git prompt on a non-terminal stdin: in a piped install that
+    # stdin is the rest of this script. Credential helpers still work; only
+    # terminal prompting is disabled.
+    if [[ ! -t 0 ]]
+    then
+        export GIT_TERMINAL_PROMPT=0
+    fi
+}
+
+function run::download_rivet_and_run_installer
+{
+    local target="$INSTALL_DIR"
+    local parent
+
+    # The full prerequisite check lives in the checkout. This function only
+    # needs git and the platform, so it may create the clone before that check
+    # runs; a failed run leaves a reusable checkout rather than a partial
+    # install.
+    command -v git >/dev/null 2>&1 || run::fail "missing prerequisite: git"
+    case "$(uname -s)" in
+        Darwin|Linux) ;;
+        MINGW*|MSYS*|CYGWIN*)
+            run::fail "Windows is supported only through WSL. Open a WSL shell and re-run this installer."
+            ;;
+        *)
+            run::fail "unsupported operating system: $(uname -s). Use macOS, Linux, or WSL."
+            ;;
+    esac
+
+    # If the target clone path already exists
+    if [[ -e "$target" ]]
+    then
+        # If it's not a directory...
+        if [[ ! -d "$target" ]]
+        then
+            run::fail "$target exists but is not a directory"
+        fi
+
+        # If it's not a git directory...
+        if [[ "$(git -C "$target" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]]
+        then
+            run::fail "$target exists but is not a git clone. Remove it and re-run."
+        fi
+    else
+        parent="${target%/*}"
+        if [[ "$parent" == "$target" ]]
+        then
+            parent="."
+        fi
+        mkdir -p -- "$parent" || run::fail "could not create $parent"
+        git clone --quiet -- "$REPO_URL" "$target" \
+            || run::fail "could not clone $REPO_URL into $target"
+    fi
+
+    [[ -f "$target/installer/run" && -f "$target/installer/lib/common.sh" ]] \
+        || run::fail "$target does not look like Rivet. Remove it and re-run."
+
+    exec "$BASH_BIN" -- "$target/installer/run" "$@"
+}
+
+function run::print_header
+{
+    printf '%sRivet%s\n' "$BOLD" "$RESET"
+}
+
+function run::verify_plugins
+{
+    local attempt
+    local output
+
+    common::step "Verifying"
+    # OpenCode loads global plugins only when run inside a project, so check
+    # from the Rivet checkout rather than the directory the user installed from.
+    # A cold background service can answer the first list before it finishes
+    # loading plugins, so retry briefly before calling it a failure.
+    for attempt in 1 2 3
+    do
+        if output="$(cd -- "$INSTALL_DIR" && common::run_interactive opencode plugin list 2>&1)" \
+            && [[ "$output" == *"@dietrichgebert/ponytail"* ]] \
+            && [[ "$output" == *"@plannotator/opencode"* ]] \
+            && [[ "$output" == *"@banburist/opencode-headsup"* ]] \
+            && [[ "$output" == *"opencode-subagent-statusline-v2"* ]]
+        then
+            common::success "Plugins"
+            return
+        fi
+        if (( attempt < 3 ))
+        then
+            sleep 1
+        fi
+    done
+
+    common::attention "Plugins" "verification failed"
+    if [[ -n "$output" ]]
+    then
+        printf '\n%s\n' "$output" >&2
+    fi
+    WARNINGS=$(( WARNINGS + 1 ))
+}
+
+# The success screen clears the viewport. On a terminal that will animate,
+# scroll the install log into the scrollback first so it stays readable.
+function run::preserve_install_log
+{
+    local rows
+    local i
+
+    if [[ ! -t 1 || "${TERM:-dumb}" == "dumb" ]]
+    then
+        return 0
+    fi
+    rows="$(tput lines 2>/dev/null)" || rows=""
+    if [[ ! "$rows" =~ ^[0-9]+$ ]] || (( rows < 1 ))
+    then
+        rows=24
+    fi
+    for ((i = 0; i < rows; i++))
+    do
+        printf '\n'
+    done
+}
+
+function run::print_summary
+{
+    local rivet_cmd
+    local rivet_init_cmd
+    local update_cmd
+    local title="Rivet is ready."
+    local subtitle_line="${DIM}Your OpenCode is now smarter.${RESET}"
+    local prompt="${DIM}\$ ${RESET}${BOLD}${CYAN}"
+    local shell_name="${SHELL##*/}"
+    local -a lines
+    local -a block_args
+
+    rivet_cmd="$(common::display_path "$INSTALL_DIR/bin/rivet")"
+    if common::rivet_shell_command_current
+    then
+        rivet_init_cmd="rivet init"
+        update_cmd="rivet update"
+    else
+        rivet_init_cmd="$(common::shell_path "$rivet_cmd") init"
+        update_cmd="$(common::shell_path "$rivet_cmd") update"
+    fi
+
+    if (( WARNINGS > 0 ))
+    then
+        title="Rivet is installed."
+        subtitle_line="${YELLOW}Installed with warnings. Check the log above.${RESET}"
+    fi
+
+    lines=(
+        "${BOLD}${title}${RESET}"
+        "$subtitle_line"
+        ""
+        "${DIM}To initialize Rivet in new projects:${RESET}"
+        "${prompt}${rivet_init_cmd}${RESET}"
+        ""
+        "${DIM}To update Rivet:${RESET}"
+        "${prompt}${update_cmd}${RESET}"
+    )
+
+    if (( SHELL_RELOAD == 1 )) && [[ -n "$shell_name" ]]
+    then
+        lines+=(
+            ""
+            "${DIM}Reload your shell to load the rivet command:${RESET}"
+            "${prompt}exec ${shell_name}${RESET}"
+        )
+    fi
+
+    lines+=(
+        ""
+        "${DIM}Install Magic Context (recommended):${RESET}"
+        "${prompt}npx @cortexkit/magic-context@latest setup --harness opencode${RESET}"
+    )
+
+    block_args=(--effect fireworks --center-lines)
+    if (( WARNINGS == 0 ))
+    then
+        block_args+=(--check)
+    fi
+
+    run::preserve_install_log
+    FIREWORKS_SHELLS=5 show_success_block "${block_args[@]}" -- "${lines[@]}"
+}
+
+function run::main
+{
+    run::print_header
+    checks::check_platform
+    checks::check_prerequisites
+    checks::check_opencode_version
+    rivet::download
+    rivet::install
+    plugins::install_plugins
+    run::verify_plugins
+    run::print_summary
+}
+
+run::parse_args "$@"
+run::resolve_install_dir
+run::require_interactive
+
+# Find the checkout this script belongs to. When run as a file,
+# BASH_SOURCE[0] is that file, so SCRIPT_DIR is its directory.
+# When piped through `curl | bash`, BASH_SOURCE[0] is empty or not a file,
+# so SCRIPT_DIR stays empty and run::download_rivet_and_run_installer clones
+# Rivet first.
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]
+then
+    source_path="${BASH_SOURCE[0]}"
+    source_dir="${source_path%/*}"
+    if [[ "$source_dir" == "$source_path" ]]
+    then
+        source_dir="."
+    fi
+    SCRIPT_DIR="$(cd -- "$source_dir" && pwd)"
+fi
+
+# Piped mode: obtain a checkout, then re-run this installer from it.
+if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/lib/common.sh" ]]
+then
+    run::download_rivet_and_run_installer "$@"
+fi
+
+# Dynamic paths: these modules live next to this script, not at a fixed
+# location ShellCheck can resolve.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/success-screen.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/steps/checks.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/steps/rivet.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/steps/plugins.sh"
+
+trap common::on_exit EXIT
+run::main

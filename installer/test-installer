@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# Run the installer end-to-end against a snapshot of this working tree.
+#
+# The snapshot is committed inside a throwaway clone, so uncommitted changes
+# are tested too. HOME, XDG directories, npm cache, and Plannotator data all
+# point into a temp directory; your real configuration is not touched.
+#
+# Usage: ./installer/test-installer [--keep]
+set -euo pipefail
+
+REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+KEEP=0
+
+function test_installer::usage
+{
+    cat <<'EOF'
+Usage: installer/test-installer [--keep]
+
+Run installer/run in a terminal against a temp snapshot of this checkout.
+
+Options:
+  --keep   Keep the temp directory even when the installer succeeds.
+  -h, --help
+           Show this help.
+
+On failure the temp directory is always kept for inspection.
+EOF
+}
+
+function test_installer::die
+{
+    printf 'error: %s\n' "$1" >&2
+    exit 1
+}
+
+for arg in "$@"
+do
+    case "$arg" in
+        --keep) KEEP=1 ;;
+        -h|--help) test_installer::usage; exit 0 ;;
+        *) test_installer::die "unknown argument: $arg (try --help)" ;;
+    esac
+done
+
+# The relay reads answers from this terminal. Without one it reaches EOF and
+# leaves the installer waiting on the pty forever.
+if [[ ! -t 0 ]]
+then
+    test_installer::die "test-installer requires an interactive terminal"
+fi
+
+for cmd in git tar opencode python3
+do
+    command -v "$cmd" >/dev/null 2>&1 || test_installer::die "missing prerequisite: $cmd"
+done
+
+git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || test_installer::die "$REPO_DIR is not a git repository"
+
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/test-installer.XXXXXX")"
+HOME_DIR="$TMP_ROOT/home"
+KIT_DIR="$HOME_DIR/.rivet"
+WORK_DIR="$TMP_ROOT/work"
+
+function test_installer::cleanup
+{
+    local status=$?
+    trap - EXIT
+    # Stop the isolated background service before removing its HOME. Otherwise
+    # it keeps writing to the temp npm cache and rm -rf races it.
+    HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
+        opencode service stop >/dev/null 2>&1 || true
+    if (( status == 0 && KEEP == 0 ))
+    then
+        # A full checkout plus npm cache is hundreds of MB; remove it after
+        # the prompt returns instead of making the user wait for rm -rf.
+        # Ignore HUP so the cleanup survives the terminal closing.
+        (
+            trap '' HUP
+            rm -rf -- "$TMP_ROOT"
+        ) </dev/null >/dev/null 2>&1 &
+    else
+        printf '\ntemp rivet: %s\n' "$KIT_DIR" >&2
+        printf 'temp home: %s\n' "$HOME_DIR" >&2
+    fi
+    exit "$status"
+}
+trap test_installer::cleanup EXIT
+
+mkdir -p \
+    "$HOME_DIR/.config" \
+    "$HOME_DIR/.local/share" \
+    "$HOME_DIR/.local/state" \
+    "$HOME_DIR/.local/bin" \
+    "$HOME_DIR/.cache" \
+    "$HOME_DIR/.npm" \
+    "$WORK_DIR"
+
+# OpenCode's background service defaults to port 49374. The isolated HOME has
+# its own service password, so it cannot reuse the real service; without a
+# separate port it tries 49374 and fails because the real one already owns it.
+SERVICE_PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
+    opencode service set port "$SERVICE_PORT" \
+    || test_installer::die "could not set the isolated OpenCode service port"
+
+git clone --quiet -- "$REPO_DIR" "$KIT_DIR"
+
+# The clone carries files tracked at HEAD; the tar overlay never removes ones
+# deleted in the working tree. Drop them first so the snapshot matches. An
+# unborn HEAD means the clone is empty, so there is nothing stale to drop.
+if git -C "$REPO_DIR" rev-parse --verify --quiet HEAD >/dev/null
+then
+    while IFS= read -r -d '' deleted
+    do
+        rm -f -- "$KIT_DIR/$deleted"
+    done < <(git -C "$REPO_DIR" diff HEAD --name-only --diff-filter=D -z)
+fi
+
+tar -C "$REPO_DIR" \
+    --exclude=.git \
+    --exclude=.venv \
+    --exclude=node_modules \
+    --exclude=__pycache__ \
+    --exclude=.pytest_cache \
+    --exclude=.mypy_cache \
+    --exclude=.ruff_cache \
+    -cf - . | tar -C "$KIT_DIR" -xf -
+
+git -C "$KIT_DIR" add -A
+if ! git -C "$KIT_DIR" diff --cached --quiet
+then
+    git -C "$KIT_DIR" \
+        -c user.name=test-installer \
+        -c user.email=test-installer@example.invalid \
+        commit --quiet -m "test-installer snapshot"
+fi
+
+(
+    cd -- "$WORK_DIR"
+    # pty.spawn cannot size the child terminal or forward Enter as \r.
+    PATH="$HOME_DIR/.local/bin:$PATH" \
+    HOME="$HOME_DIR" \
+    XDG_CONFIG_HOME="$HOME_DIR/.config" \
+    XDG_DATA_HOME="$HOME_DIR/.local/share" \
+    XDG_STATE_HOME="$HOME_DIR/.local/state" \
+    XDG_CACHE_HOME="$HOME_DIR/.cache" \
+    npm_config_cache="$HOME_DIR/.npm" \
+    PLANNOTATOR_DATA_DIR="$HOME_DIR/.plannotator" \
+    CODEX_HOME="$HOME_DIR/.codex" \
+    CLAUDE_CONFIG_DIR="$HOME_DIR/.claude" \
+    GEMINI_CONFIG_DIR="$HOME_DIR/.gemini" \
+    QWEN_HOME="$HOME_DIR/.qwen" \
+    VIBE_HOME="$HOME_DIR/.vibe" \
+    KIRO_HOME="$HOME_DIR/.kiro" \
+    python3 -c "$(cat <<'PY'
+import fcntl
+import os
+import pty
+import select
+import struct
+import sys
+import termios
+
+try:
+    size = os.get_terminal_size(0)
+except OSError:
+    size = os.terminal_size((80, 24))
+if size.lines == 0 or size.columns == 0:
+    size = os.terminal_size((80, 24))
+
+# Set the terminal raw before the child starts, so early keystrokes are not
+# translated (ICRNL turns Enter's CR into LF, which raw-mode prompts ignore).
+stdin_open = True
+try:
+    saved = termios.tcgetattr(0)
+    mode = termios.tcgetattr(0)
+    mode[0] &= ~termios.ICRNL
+    mode[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG)
+    mode[6][termios.VMIN] = 1
+    mode[6][termios.VTIME] = 0
+    termios.tcsetattr(0, termios.TCSANOW, mode)
+except termios.error:
+    saved = None
+
+try:
+    pid, fd = pty.fork()
+    if pid == 0:
+        fcntl.ioctl(
+            0,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", size.lines, size.columns, 0, 0),
+        )
+        os.execvp(sys.argv[1], sys.argv[1:])
+
+    while True:
+        watch = [fd] + ([0] if stdin_open else [])
+        ready, _, _ = select.select(watch, [], [])
+        if fd in ready:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            os.write(1, data)
+        if stdin_open and 0 in ready:
+            data = os.read(0, 4096)
+            if not data:
+                stdin_open = False
+            else:
+                os.write(fd, data)
+finally:
+    if saved is not None:
+        termios.tcsetattr(0, termios.TCSADRAIN, saved)
+
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+PY
+)" "$BASH" "$KIT_DIR/installer/run"
+)

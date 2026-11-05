@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import jsonc
 import manifest
 
 UP_TO_DATE = 0
@@ -166,9 +167,17 @@ def _copy_tree(
     for item in from_dir.iterdir():
         dest = to_dir / item.name
         upstream.add(item.name)
+        if item.is_symlink():
+            raise RuntimeError(f"refusing to copy symlink {item}")
         if item.is_dir():
+            if dest.is_symlink() or (dest.exists() and not dest.is_dir()):
+                dest.unlink()
             _copy_tree(item, dest)
         else:
+            if dest.is_dir() and not dest.is_symlink():
+                shutil.rmtree(dest)
+            elif dest.is_symlink():
+                dest.unlink()
             shutil.copy2(item, dest)
     # Remove local entries absent upstream (files deleted upstream must not
     # linger as stale copies).
@@ -220,6 +229,7 @@ def _merge_file(
     # No recorded base sha yet — merge against an empty file so all upstream
     # content lands as additions instead of a bogus conflict.
     if not base_path.exists():
+        base_path.parent.mkdir(parents=True, exist_ok=True)
         base_path.write_text("")
     result = _run("git", "merge-file", "-p", ours_path, base_path, theirs_path)
     # git merge-file: 0 = clean merge, 1 = conflicts, 2+ = hard error (e.g. a
@@ -231,8 +241,27 @@ def _merge_file(
             f"git merge-file failed (exit {result.returncode}) for {ours_path}; "
             "local customization preserved"
         )
-    ours_path.write_text(result.stdout)
+    jsonc.write_atomic(str(ours_path), result.stdout)
     return result.returncode != 0
+
+
+def _tree_files(root: Path) -> set[Path]:
+    """Return relative paths of files and symlinks under root."""
+    if not root.exists():
+        return set()
+    return {
+        item.relative_to(root)
+        for item in root.rglob("*")
+        if item.is_file() or item.is_symlink()
+    }
+
+
+def _prune_empty_dirs(root: Path, relative: Path) -> None:
+    """Remove directories left empty after deleting relative under root."""
+    parent = (root / relative).parent
+    while parent != root and parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
 
 
 def _merge_tree(
@@ -252,20 +281,38 @@ def _merge_tree(
         True if any file left conflicts.
     """
     conflict = False
-    for theirs_file in theirs_path.rglob("*"):
-        if not theirs_file.is_file():
-            continue
-        relative = theirs_file.relative_to(theirs_path)
+    paths = (
+        _tree_files(local_path)
+        | _tree_files(base_path)
+        | _tree_files(theirs_path)
+    )
+    for relative in sorted(paths):
         local_file = local_path / relative
-        base_file = local_file if base_path == local_path else base_path / relative
-        local_file.parent.mkdir(parents=True, exist_ok=True)
-        # New upstream file with no local counterpart — copy it in, nothing
-        # of ours to merge.
-        if not local_file.exists():
-            shutil.copyfile(theirs_file, local_file)
+        base_file = base_path / relative
+        theirs_file = theirs_path / relative
+        if local_file.is_symlink() or theirs_file.is_symlink():
+            raise RuntimeError(f"refusing to merge symlink {relative}")
+        if theirs_file.exists():
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            # New upstream file with no local counterpart — copy it in with its
+            # mode, nothing of ours to merge.
+            if not local_file.exists():
+                shutil.copy2(theirs_file, local_file)
+                continue
+            if _merge_file(local_file, base_file, theirs_file):
+                conflict = True
             continue
-        if _merge_file(local_file, base_file, theirs_file):
-            conflict = True
+        # Upstream no longer has this path. Delete it only when the local copy
+        # is unchanged from the base; keep local edits and local additions.
+        if not local_file.is_file():
+            continue
+        unchanged = (
+            base_file.is_file()
+            and local_file.read_bytes() == base_file.read_bytes()
+        )
+        if unchanged:
+            local_file.unlink()
+            _prune_empty_dirs(local_path, relative)
     return conflict
 
 
@@ -362,7 +409,7 @@ def update_artifact(
     provenance = artifact.get("provenance", "original")
     # "original" artifacts are user-owned files we never touch.
     if provenance == "original":
-        print(f"  {name}: original — skipped")
+        print(f"  {name}: skipped (original)")
         return 0
 
     repo = artifact["source_repo"]
@@ -375,8 +422,8 @@ def update_artifact(
     if provenance == "fork" and _has_conflict_markers(local_path):
         target = artifact["src"]
         print(
-            f"  {name}: unresolved conflict markers in {target} — "
-            "resolve them, then re-run"
+            f"  {name}: unresolved conflict markers in {target}. "
+            "Resolve them, then re-run."
         )
         return ERROR
 
@@ -392,7 +439,7 @@ def update_artifact(
             print(f"  {name}: up to date")
             return UP_TO_DATE
         pinned = sha or "none"
-        print(f"  {name}: behind (pinned {pinned} -> {head})")
+        print(f"  {name}: behind (pinned {pinned}, upstream {head})")
         return DRIFT
 
     if provenance == "vendor":
@@ -408,14 +455,16 @@ def update_artifact(
     # No sha pinned yet — this is the first fork sync: record HEAD as the new
     # base without touching local customizations.
     if not sha:
-        print(f"  {name}: first fork update — pinning base, keeping customizations")
+        print(f"  {name}: first fork update: pinning base, keeping customizations")
         manifest.set_sha(manifest_path, name, head)
         return 0
+
     try:
         conflict = _apply_fork(artifact, local_path)
     except Exception as error:  # pylint: disable=broad-exception-caught
         print(f"  {name}: update failed: {error}")
         return ERROR
+
     if conflict:
         # Advance the base even though markers remain: once resolved, the file
         # is based on upstream HEAD, and replaying this same merge on a re-run
@@ -424,9 +473,11 @@ def update_artifact(
         manifest.set_sha(manifest_path, name, head)
         local_target = artifact["src"]
         print(
-            f"  {name}: MERGE CONFLICTS — resolve markers in {local_target}, "
-            "then re-run"
+            f"  {name}: merge conflict in {local_target}. "
+            "Resolve the markers, then re-run."
         )
         return 0
+
+    # No conflicts remain — update the pinned sha to HEAD.
     manifest.set_sha(manifest_path, name, head)
     return 0

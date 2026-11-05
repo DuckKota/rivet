@@ -17,7 +17,7 @@ Perform a deliberate second planning pass over an existing OpenSpec change to im
    If a name is provided, use it. Otherwise:
    - Infer from conversation context if the user mentioned a change
    - Auto-select if only one active change exists
-   - If ambiguous, run `openspec list --json` to get available changes and use the **AskUserQuestion tool** to let the user select
+   - If ambiguous, run `openspec list --json` to get available changes and ask the user to select
 
    Always announce: "Refining change: <name>" and how to override (e.g., `/opsx-refine <other>`).
 

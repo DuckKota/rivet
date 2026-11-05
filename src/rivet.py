@@ -310,6 +310,50 @@ def _checkout_state() -> str:
     return "current" if head.stdout.strip() == upstream.stdout.strip() else "behind"
 
 
+_UPDATE_AREAS = (
+    ("commands", "command"),
+    ("skills", "skill"),
+    ("themes", "theme"),
+    ("plugins", "plugin"),
+    ("instructions", "instruction"),
+    ("core", "core file"),
+)
+_UPDATE_AREA_NAMES = {name for name, _ in _UPDATE_AREAS}
+
+
+def _change_area(path: str) -> str:
+    """Return the summary bucket for a changed repository path."""
+    parts = path.split("/")
+    if len(parts) > 2 and parts[0] == "content" and parts[1] in _UPDATE_AREA_NAMES:
+        return parts[1]
+    return "core"
+
+
+def _change_summary(paths: list[str]) -> str:
+    """Return a summary like 8 files (5 commands, 2 skills, 1 core file)."""
+    if not paths:
+        return ""
+    counts = dict.fromkeys(_UPDATE_AREA_NAMES, 0)
+    for path in paths:
+        counts[_change_area(path)] += 1
+    details = [
+        output.plural(counts[name], noun)
+        for name, noun in _UPDATE_AREAS
+        if counts[name]
+    ]
+    total = output.plural(len(paths), "file")
+    joined = ", ".join(details)
+    return f"{total} ({joined})"
+
+
+def _changed_files(*revisions: str) -> list[str]:
+    """Return repository paths changed across a Git revision range."""
+    diff = _git("diff", "--name-only", *revisions)
+    if diff.returncode != 0:
+        return []
+    return [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+
+
 def _update_checkout() -> bool | None:
     """Pull the Rivet checkout. Returns True/False, or None when not a checkout."""
     state = _checkout_state()
@@ -329,13 +373,23 @@ def _update_checkout() -> bool | None:
         output.info("Commit or stash them, then re-run `rivet update`.")
         return False
 
+    before = _git("rev-parse", "HEAD")
     pulled = _git("pull", "--ff-only", "--quiet")
     if pulled.returncode != 0:
         output.failure("Rivet", "could not update the checkout")
         for line in (pulled.stderr or pulled.stdout).strip().splitlines()[-3:]:
             output.info(line)
         return False
-    output.success("Rivet", "updated")
+    after = _git("rev-parse", "HEAD")
+    changed = (
+        _changed_files(before.stdout.strip(), after.stdout.strip())
+        if before.returncode == 0 and after.returncode == 0
+        else []
+    )
+    summary = _change_summary(changed)
+    output.success("Rivet", f"updated: {summary}" if summary else "updated")
+    for path in changed:
+        output.debug(path)
     return True
 
 
@@ -354,7 +408,12 @@ def _run_update(
     if dry_run:
         state = _checkout_state()
         if state == "behind":
-            output.attention("Rivet", "update available")
+            changed = _changed_files("HEAD...@{u}")
+            summary = _change_summary(changed)
+            detail = f"update available: {summary}" if summary else "update available"
+            output.attention("Rivet", detail)
+            for path in changed:
+                output.debug(path)
             output.info("Run `rivet update` to apply.")
         elif state == "current":
             output.success("Rivet", "up to date")

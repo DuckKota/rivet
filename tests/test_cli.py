@@ -478,6 +478,49 @@ def test_update_checkout_pulls_when_clean(monkeypatch, capsys):
     assert "updated" in capsys.readouterr().out
 
 
+def test_change_summary_counts_areas():
+    assert rivet._change_summary([]) == ""
+    assert rivet._change_summary(
+        ["content/commands/a.md", "content/unknown/b", "src/rivet.py"]
+    ) == "3 files (1 command, 2 core files)"
+
+
+def test_update_checkout_reports_changed_files(monkeypatch, capsys):
+    monkeypatch.setattr(rivet, "_checkout_state", lambda: "behind")
+    monkeypatch.setattr(
+        rivet,
+        "_changed_files",
+        lambda *revisions: [
+            "content/commands/foo.md",
+            "content/commands/bar.md",
+            "content/skills/baz/SKILL.md",
+            "src/rivet.py",
+        ],
+    )
+    monkeypatch.setattr(
+        rivet,
+        "_git",
+        lambda *args, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    assert rivet._update_checkout() is True
+    assert "4 files (2 commands, 1 skill, 1 core file)" in capsys.readouterr().out
+
+
+def test_update_dry_run_reports_incoming_changes(cli, monkeypatch, capsys):
+    monkeypatch.setattr(rivet, "_checkout_state", lambda: "behind")
+    monkeypatch.setattr(
+        rivet,
+        "_changed_files",
+        lambda *revisions: ["content/themes/x.json", "README.md"],
+    )
+
+    assert rivet.main(["update", "--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "update available: 2 files (1 theme, 1 core file)" in out
+
+
 def test_update_runs_init_in_fresh_process(cli, monkeypatch):
     calls = []
     monkeypatch.setattr(rivet, "_update_checkout", lambda: True)

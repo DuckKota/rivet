@@ -286,7 +286,8 @@ If any rule is violated: fix it, then re-run validation before continuing.
 
 # Output Format
 
-Return only:
+Begin the response with a blank line so an injected marker cannot share a
+line with the first heading. Then return only:
 
 ## 1. Commit message
 
